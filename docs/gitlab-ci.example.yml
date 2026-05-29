@@ -1,0 +1,9 @@
+stages:
+  - check
+
+aiflow-check:
+  image: node:20
+  stage: check
+  script:
+    - npm ci
+    - npm run check

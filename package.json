@@ -1,0 +1,23 @@
+{
+  "name": "aiflow-workspace",
+  "private": true,
+  "version": "0.1.1",
+  "type": "module",
+  "packageManager": "npm@11.12.1",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "node --check packages/cli/src/cli.js && node --check packages/cli/src/core.js && node --check packages/cli/src/constants.js && node --check packages/cli/src/config.js && node --check packages/cli/src/fs-utils.js && node --check packages/cli/src/project.js && node --check packages/cli/src/check.js && node --check packages/cli/src/ui.js && node --check packages/cli/src/delivery.js && node --check packages/cli/src/templates.js && node --check packages/cli/src/test-scenarios.js && node --check scripts/package-smoke.mjs",
+    "lint": "node --check packages/cli/src/cli.js && node --check packages/cli/src/core.js && node --check packages/cli/src/constants.js && node --check packages/cli/src/config.js && node --check packages/cli/src/fs-utils.js && node --check packages/cli/src/project.js && node --check packages/cli/src/check.js && node --check packages/cli/src/ui.js && node --check packages/cli/src/delivery.js && node --check packages/cli/src/templates.js && node --check packages/cli/src/test-scenarios.js && node --check scripts/package-smoke.mjs",
+    "typecheck": "node --check packages/cli/src/cli.js && node --check packages/cli/src/core.js && node --check packages/cli/src/constants.js && node --check packages/cli/src/config.js && node --check packages/cli/src/fs-utils.js && node --check packages/cli/src/project.js && node --check packages/cli/src/check.js && node --check packages/cli/src/ui.js && node --check packages/cli/src/delivery.js && node --check packages/cli/src/templates.js && node --check packages/cli/src/test-scenarios.js && node --check scripts/package-smoke.mjs",
+    "test": "node --test packages/cli/test/*.test.js",
+    "check": "npm run lint && npm run typecheck && node packages/cli/src/cli.js doctor && node packages/cli/src/cli.js check --ci && node --test packages/cli/test/*.test.js",
+    "example:ui": "node examples/ui-app/server.mjs",
+    "prepack": "npm run check",
+    "pack:dry": "npm pack --dry-run --workspace packages/cli --cache ./.npm-cache",
+    "smoke:package": "node scripts/package-smoke.mjs",
+    "dogfood": "node packages/cli/src/cli.js doctor && node packages/cli/src/cli.js check --ci && npm run smoke:package",
+    "release:check": "npm run check && npm run pack:dry && npm run smoke:package"
+  }
+}
