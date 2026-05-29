@@ -21,13 +21,13 @@
     "delivery",
     "visual-testing"
   ],
-  "homepage": "http://git.100credit.cn/fe/public/creative/wangjiang/aiflow#readme",
+  "homepage": "https://github.com/wj6541/aiflow#readme",
   "bugs": {
-    "url": "http://git.100credit.cn/fe/public/creative/wangjiang/aiflow/-/issues"
+    "url": "https://github.com/wj6541/aiflow/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+http://git.100credit.cn/fe/public/creative/wangjiang/aiflow.git",
+    "url": "git+https://github.com/wj6541/aiflow.git",
     "directory": "packages/cli"
   },
   "scripts": {

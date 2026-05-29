@@ -1,0 +1,23 @@
+version: 1
+
+mode: legacy
+strictness: standard
+ui: auto
+base_branch: main
+package_manager: npm
+
+roles:
+  current: dev
+
+legacy:
+  level: L1
+
+checks:
+  require_source: true
+  require_validation: true
+  require_risk: true
+  require_ui_evidence: auto
+
+delivery:
+  require_explicit_release: true
+  require_explicit_archive: true

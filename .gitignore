@@ -1,0 +1,9 @@
+# Dependencies and local caches
+node_modules/
+.npm-cache/
+
+# OS/editor files
+.DS_Store
+
+# aiflow runtime state; keep .aiflow/config.yaml committed
+.aiflow/state/*.yaml

@@ -8,7 +8,7 @@
 
 Please do not open a public issue for sensitive security reports.
 
-Until the public GitHub repository and security contact are finalized, report suspected vulnerabilities privately to the project maintainers. Include:
+Report suspected vulnerabilities privately to the project maintainers for `https://github.com/wj6541/aiflow`. Include:
 
 - affected version or commit
 - operating system and Node.js version
