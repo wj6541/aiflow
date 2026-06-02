@@ -1,6 +1,7 @@
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { EXIT } from "./constants.js";
+import { appendEvidence } from "./evidence.js";
 import { ensureDir, exists, readText, relative, writeText } from "./fs-utils.js";
 import { hasPlaywright } from "./project.js";
 
@@ -27,8 +28,10 @@ export async function generateAiTestScenarios({ root, context, sources = {}, out
   const scenarioPath = out
     ? path.resolve(root, out)
     : path.join(context.changeDir, "test-scenarios.yaml");
+  const intentPath = path.join(context.changeDir, "test-intent.yaml");
 
   writeText(promptPath, renderGenerationPrompt({ context, input, missingInfo }));
+  writeText(intentPath, renderTestIntentYaml({ root, context, scenarioPath, missingInfo }));
 
   const blocked = missingInfo.length > 0;
   if (blocked || !ai) {
@@ -42,6 +45,7 @@ export async function generateAiTestScenarios({ root, context, sources = {}, out
         "AI test scenario generation input is incomplete.",
         `- base_prompt: ${relative(root, basePath)}`,
         `- generation_prompt: ${relative(root, promptPath)}`,
+        `- test_intent: ${relative(root, intentPath)}`,
         `- scenarios: ${relative(root, scenarioPath)}`,
         `- missing_info: ${missingInfo.join(", ")}`
       ].join("\n") + "\n"
@@ -58,6 +62,7 @@ export async function generateAiTestScenarios({ root, context, sources = {}, out
 
     if (!aiResult.ok) {
       writeText(scenarioPath, renderScenarioYaml({ context, input, missingInfo: ["ai_generation_failed"] }));
+      writeText(intentPath, renderTestIntentYaml({ root, context, scenarioPath, missingInfo: ["ai_generation_failed"] }));
       return {
         code: aiResult.code,
         error: `${aiResult.error}\n`
@@ -74,10 +79,11 @@ export async function generateAiTestScenarios({ root, context, sources = {}, out
         "AI test scenarios generated and waiting for human review.",
         `- base_prompt: ${relative(root, basePath)}`,
         `- generation_prompt: ${relative(root, promptPath)}`,
+        `- test_intent: ${relative(root, intentPath)}`,
         `- ai_response: ${relative(root, rawPath)}`,
         `- scenarios: ${relative(root, scenarioPath)}`,
         "- human_review_required: true",
-        "- next: aiflow test approve"
+        "- next: aiflow test review"
       ].join("\n") + "\n"
     };
   }
@@ -88,6 +94,7 @@ export async function generateAiTestScenarios({ root, context, sources = {}, out
       "AI test scenario generation package is ready for human review.",
       `- base_prompt: ${relative(root, basePath)}`,
       `- generation_prompt: ${relative(root, promptPath)}`,
+      `- test_intent: ${relative(root, intentPath)}`,
       `- scenarios: ${relative(root, scenarioPath)}`,
       "- human_review_required: true",
       "- next: aiflow test generate --ai"
@@ -95,9 +102,29 @@ export async function generateAiTestScenarios({ root, context, sources = {}, out
   };
 }
 
-export function runTestScenarios({ root, context, url, scenarioFile = "", reviewed = false }) {
+export function reviewTestIntent({ root, context, reason = "" }) {
+  const intentPath = path.join(context.changeDir, "test-intent.yaml");
+  const scenarioPath = path.join(context.changeDir, "test-scenarios.yaml");
+  if (!exists(intentPath) && !exists(scenarioPath)) {
+    return {
+      ok: false,
+      error: "No test-intent.yaml or test-scenarios.yaml found for the active change. Run aiflow test generate first."
+    };
+  }
+
+  const current = readText(intentPath);
+  const next = current.trim()
+    ? markHumanReviewed(current, reason)
+    : renderReviewedIntentFromScenario({ root, context, scenarioPath, reason });
+  writeText(intentPath, next);
+  return { ok: true, intentPath };
+}
+
+export function runTestScenarios({ root, context, url, command = "", scenarioFile = "", reviewed = false }) {
+  if (command) return runCommandHarness({ root, context, command });
+
   if (!url) {
-    return { code: EXIT.CONFIG_ERROR, error: "Usage: aiflow test run --url <base-url> [--scenario file] [--reviewed]\n" };
+    return { code: EXIT.CONFIG_ERROR, error: "Usage: aiflow test run --command <command> | aiflow test run --url <base-url> [--scenario file] [--reviewed]\n" };
   }
 
   const testsDir = path.join(root, ".aiflow", "artifacts", "tests");
@@ -136,8 +163,11 @@ export function runTestScenarios({ root, context, url, scenarioFile = "", review
 
   const runnerPath = path.join(testsDir, "playwright-scenario-runner.mjs");
   const resultsPath = path.join(testsDir, "scenario-results.json");
+  const harnessJsonPath = path.join(testsDir, "harness-result.json");
+  const harnessYamlPath = path.join(testsDir, "harness-result.yaml");
   const screenshotsDir = path.join(testsDir, "screenshots");
   writeText(runnerPath, playwrightScenarioRunnerSource());
+  const harnessCommand = `${process.execPath} ${relative(root, runnerPath)} ${relative(root, scenarioPath)} ${url} ${relative(root, resultsPath)} ${relative(root, screenshotsDir)}`;
 
   if (!hasPlaywright(root)) {
     writeText(resultsPath, `${JSON.stringify({
@@ -145,13 +175,26 @@ export function runTestScenarios({ root, context, url, scenarioFile = "", review
       reason: "Playwright is not installed or configured.",
       scenarios: []
     }, null, 2)}\n`);
+    writeHarnessResult({
+      root,
+      context,
+      jsonPath: harnessJsonPath,
+      yamlPath: harnessYamlPath,
+      command: harnessCommand,
+      status: "not_run",
+      exitCode: EXIT.MISSING_DEPENDENCY,
+      reason: "Playwright is not installed or configured.",
+      artifacts: [runnerPath, resultsPath]
+    });
+    appendHarnessEvidence({ root, context, status: "not_run", command: harnessCommand, artifacts: [harnessYamlPath, resultsPath], note: "Playwright is not installed or configured." });
     return {
       code: EXIT.MISSING_DEPENDENCY,
       message: [
         "Test scenario runner created.",
         "Playwright is not installed or configured, so scenarios were not executed.",
         `- runner: ${relative(root, runnerPath)}`,
-        `- results: ${relative(root, resultsPath)}`
+        `- results: ${relative(root, resultsPath)}`,
+        `- harness_result: ${relative(root, harnessYamlPath)}`
       ].join("\n") + "\n"
     };
   }
@@ -165,20 +208,106 @@ export function runTestScenarios({ root, context, url, scenarioFile = "", review
   ], { cwd: root, encoding: "utf8" });
 
   if (run.status !== 0) {
+    writeHarnessResult({
+      root,
+      context,
+      jsonPath: harnessJsonPath,
+      yamlPath: harnessYamlPath,
+      command: harnessCommand,
+      status: "failed",
+      exitCode: run.status ?? 1,
+      reason: run.stderr || run.stdout || "Playwright scenario run failed.",
+      artifacts: [runnerPath, resultsPath, screenshotsDir]
+    });
+    appendHarnessEvidence({ root, context, status: "failed", command: harnessCommand, artifacts: [harnessYamlPath, resultsPath, screenshotsDir], note: "Playwright scenario run failed." });
     return {
       code: EXIT.CHECK_FAILED,
       error: run.stderr || run.stdout || "Playwright scenario run failed.\n"
     };
   }
 
+  writeHarnessResult({
+    root,
+    context,
+    jsonPath: harnessJsonPath,
+    yamlPath: harnessYamlPath,
+    command: harnessCommand,
+    status: "passed",
+    exitCode: 0,
+    reason: "Playwright scenario run passed.",
+    artifacts: [runnerPath, resultsPath, screenshotsDir]
+  });
+  appendHarnessEvidence({ root, context, status: "passed", command: harnessCommand, artifacts: [harnessYamlPath, resultsPath, screenshotsDir], note: "Playwright scenario run passed." });
+
   return {
     code: EXIT.PASS,
     message: [
       "✓ Test scenarios executed.",
       `- results: ${relative(root, resultsPath)}`,
-      `- screenshots: ${relative(root, screenshotsDir)}`
+      `- screenshots: ${relative(root, screenshotsDir)}`,
+      `- harness_result: ${relative(root, harnessYamlPath)}`
     ].join("\n") + "\n"
   };
+}
+
+function runCommandHarness({ root, context, command }) {
+  const testsDir = path.join(root, ".aiflow", "artifacts", "tests");
+  ensureDir(testsDir);
+  const harnessJsonPath = path.join(testsDir, "harness-result.json");
+  const harnessYamlPath = path.join(testsDir, "harness-result.yaml");
+  const outputPath = path.join(testsDir, "harness-output.txt");
+  const startedAt = new Date().toISOString();
+  const run = spawnSync(command, {
+    cwd: root,
+    encoding: "utf8",
+    shell: true
+  });
+  const combinedOutput = [
+    `$ ${command}`,
+    "",
+    "## stdout",
+    run.stdout || "",
+    "## stderr",
+    run.stderr || ""
+  ].join("\n");
+  writeText(outputPath, combinedOutput);
+  const status = run.status === 0 ? "passed" : "failed";
+  writeHarnessResult({
+    root,
+    context,
+    jsonPath: harnessJsonPath,
+    yamlPath: harnessYamlPath,
+    command,
+    status,
+    exitCode: run.status ?? 1,
+    reason: status === "passed" ? "Command harness passed." : "Command harness failed.",
+    artifacts: [outputPath],
+    recordedAt: startedAt
+  });
+  appendHarnessEvidence({ root, context, status, command, artifacts: [harnessYamlPath, outputPath], note: status === "passed" ? "Command harness passed." : "Command harness failed." });
+  const message = [
+    status === "passed" ? "✓ Harness command executed." : "✗ Harness command failed.",
+    `- command: ${command}`,
+    `- exit_code: ${run.status ?? 1}`,
+    `- output: ${relative(root, outputPath)}`,
+    `- harness_result: ${relative(root, harnessYamlPath)}`
+  ].join("\n") + "\n";
+  return status === "passed"
+    ? { code: EXIT.PASS, message }
+    : { code: EXIT.CHECK_FAILED, error: message };
+}
+
+function appendHarnessEvidence({ root, context, status, command, artifacts, note }) {
+  appendEvidence({
+    root,
+    context,
+    type: "validation",
+    source: "harness",
+    status,
+    command,
+    artifacts,
+    note
+  });
 }
 
 export function requiresHumanReview(scenarioText) {
@@ -186,7 +315,36 @@ export function requiresHumanReview(scenarioText) {
 }
 
 function hasTestScenarioApproval(context) {
-  return readText(path.join(context.changeDir, "approvals.md")).includes("Test Scenario Approval");
+  const approvals = readText(path.join(context.changeDir, "approvals.md"));
+  return approvals.includes("Test Scenario Approval") || approvals.includes("Test Intent Approval");
+}
+
+function writeHarnessResult({ root, context, jsonPath, yamlPath, command, status, exitCode, reason, artifacts, recordedAt = "" }) {
+  const data = {
+    source: "harness",
+    change: context.state.active_change,
+    command,
+    status,
+    exit_code: exitCode,
+    recorded_at: recordedAt || new Date().toISOString(),
+    reason,
+    artifacts: artifacts.map((item) => relative(root, item))
+  };
+  writeText(jsonPath, `${JSON.stringify(data, null, 2)}\n`);
+  writeText(yamlPath, renderHarnessYaml(data));
+}
+
+function renderHarnessYaml(data) {
+  return `source: ${data.source}
+change: ${data.change}
+command: ${data.command}
+status: ${data.status}
+exit_code: ${data.exit_code}
+recorded_at: ${data.recorded_at}
+reason: ${String(data.reason || "").replace(/\r?\n/g, " ").trim()}
+artifacts:
+${data.artifacts.length ? data.artifacts.map((item) => `  - ${item}`).join("\n") : "  - none"}
+`;
 }
 
 function collectScenarioInput({ root, context, sources }) {
@@ -289,6 +447,51 @@ assumptions:
   - Generated scenarios must be reviewed by a human before CI enforcement.
 scenarios: []
 `;
+}
+
+function renderTestIntentYaml({ root, context, scenarioPath, missingInfo }) {
+  const status = missingInfo.length ? "blocked_by_missing_input" : "waiting_for_human_review";
+  return `source: ai_generated
+generated_by: ai
+change: ${context.state.active_change}
+status: ${status}
+human_review_required: true
+human_reviewed: false
+reviewed_by:
+reviewed_at:
+review_reason:
+scenario_file: ${relative(root, scenarioPath)}
+missing_info:
+${missingInfo.length ? missingInfo.map((item) => `  - ${item}`).join("\n") : "  - none"}
+scenarios:
+  - source: ${relative(root, scenarioPath)}
+`;
+}
+
+function renderReviewedIntentFromScenario({ root, context, scenarioPath, reason }) {
+  return markHumanReviewed(renderTestIntentYaml({
+    root,
+    context,
+    scenarioPath,
+    missingInfo: []
+  }), reason);
+}
+
+function markHumanReviewed(text, reason) {
+  const reviewedBy = process.env.USER || process.env.USERNAME || "unknown";
+  const reviewedAt = new Date().toISOString();
+  let next = String(text || "");
+  next = setYamlScalar(next, "human_reviewed", "true");
+  next = setYamlScalar(next, "reviewed_by", reviewedBy);
+  next = setYamlScalar(next, "reviewed_at", reviewedAt);
+  next = setYamlScalar(next, "review_reason", reason || "human reviewed test intent");
+  return ensureTrailingNewline(next);
+}
+
+function setYamlScalar(text, key, value) {
+  const pattern = new RegExp(`^${key}:.*$`, "m");
+  if (pattern.test(text)) return text.replace(pattern, `${key}: ${value}`);
+  return `${text.replace(/\s*$/, "\n")}${key}: ${value}\n`;
 }
 
 async function requestAiScenarios({ prompt, apiUrl, apiKey, model }) {

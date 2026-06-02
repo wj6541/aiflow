@@ -1,13 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
-import { EXIT, RISKS, ROLES } from "./constants.js";
+import { CHANGE_TYPES, EXIT, RISKS, ROLES } from "./constants.js";
 import { collectChecks, renderCheck, renderChecksState, renderStatus, resolveChangedFiles } from "./check.js";
 import { defaultConfig, inspectConfigMigration, loadConfig, loadState, renderConfig, renderSimpleYaml, updateState } from "./config.js";
 import { appendApproval, approveDelivery, archiveDelivery, prepareDelivery, recordDeliveryAction } from "./delivery.js";
-import { ensureDir, exists, relative, writeIfMissing, writeText } from "./fs-utils.js";
+import { appendEvidence, listEvidence } from "./evidence.js";
+import { ensureDir, exists, readText, relative, writeIfMissing, writeText } from "./fs-utils.js";
 import { currentCommit, detectAiRules, detectCi, detectCommands, detectPackageManager, detectTechStack, detectWorkspace, hasPlaywright, inspectOpenSpec, inspectRuleConflicts, isGitRepo, readPackageJson } from "./project.js";
-import { defaultAgents, defaultOpenSpecReadme, defaultProjectProfile, defaultTools, templateDesign, templateProposal, templateRole, templateTasks, templateUi, templateVisualValidation } from "./templates.js";
-import { generateAiTestScenarios, runTestScenarios, writeAiTestBasePrompt } from "./test-scenarios.js";
+import { defaultAgents, defaultOpenSpecReadme, defaultProjectProfile, defaultTools, templateDesign, templateProposal, templateRequirementSnapshot, templateRole, templateTasks, templateUi, templateVisualValidation } from "./templates.js";
+import { generateAiTestScenarios, reviewTestIntent, runTestScenarios, writeAiTestBasePrompt } from "./test-scenarios.js";
 import { addUiDeviation, listUiDeviations, uiClassify as buildUiClassify, uiVerify as runUiVerify } from "./ui.js";
 
 export { EXIT };
@@ -29,6 +30,12 @@ export async function runCli(argv, io) {
   if (command === "init") return commandInit(parsed, io);
   if (command === "doctor") return commandDoctor(parsed, io);
   if (command === "change") return commandChange(parsed, io);
+  if (command === "intake") return commandIntake(parsed, io);
+  if (command === "route") return commandRoute(parsed, io);
+  if (command === "next") return commandNext(parsed, io);
+  if (command === "context") return commandContext(parsed, io);
+  if (command === "prompt") return commandPrompt(parsed, io);
+  if (command === "evidence") return commandEvidence(parsed, io);
   if (command === "check") return commandCheck(parsed, io);
   if (command === "ui") return commandUi(parsed, io);
   if (command === "test") return commandTest(parsed, io);
@@ -199,15 +206,114 @@ function commandChange(parsed, io) {
   return fail(io, EXIT.CONFIG_ERROR, "Usage: aiflow change start|status|list|approve");
 }
 
+function commandIntake(parsed, io) {
+  const root = io.cwd;
+  const topic = parsed.positionals[1];
+  if (!topic) return fail(io, EXIT.CONFIG_ERROR, "Usage: aiflow intake <topic> [--type bugfix] [--from dev] [--risk s1]");
+  const slug = slugify(topic);
+  const type = normalizeChangeType(value(parsed, "type", "bugfix"));
+  const role = value(parsed, "from", value(parsed, "role", defaultEntryRole(type)));
+  const risk = value(parsed, "risk", "s1").toLowerCase();
+  const hasUi = Boolean(parsed.flags.ui) || type === "ui_change";
+
+  if (!CHANGE_TYPES.has(type)) return fail(io, EXIT.CONFIG_ERROR, `Invalid change type: ${type}`);
+  if (!ROLES.has(role)) return fail(io, EXIT.CONFIG_ERROR, `Invalid role: ${role}`);
+  if (!RISKS.has(risk)) return fail(io, EXIT.CONFIG_ERROR, `Invalid risk: ${risk}`);
+
+  const configResult = loadConfig(root);
+  if (!configResult.ok) return fail(io, EXIT.CONFIG_ERROR, configResult.error);
+
+  const changeDir = path.join(root, "openspec", "changes", slug);
+  ensureDir(changeDir);
+  const route = routeForChange({ type, entryRole: role, risk, uiRequired: hasUi || configResult.config.ui === "required" });
+  const writes = [];
+  const scaffold = {
+    "change.yaml": renderChangeYaml({
+      id: slug,
+      type,
+      entryRole: role,
+      currentRole: role,
+      requirementLevel: route.requirementLevel,
+      risk,
+      uiRequired: route.uiRequired
+    }),
+    "route.yaml": renderRouteYaml(route),
+    "proposal.md": templateProposal(slug),
+    "design.md": templateDesign(slug),
+    "tasks.md": templateTasks(slug),
+    "pm.md": templateRole("PM", slug),
+    "architect.md": templateRole("Architect", slug),
+    "dev.md": templateRole("Dev", slug),
+    "qa.md": templateRole("QA", slug),
+    "release.md": templateRole("Release", slug),
+    "ui.md": templateUi(slug, hasUi),
+    "visual-validation.md": templateVisualValidation(slug),
+    "approvals.md": "# Approvals\n\n"
+  };
+
+  for (const [name, content] of Object.entries(scaffold)) {
+    writeIfMissing(path.join(changeDir, name), content, writes);
+  }
+
+  const requirementPath = path.join(changeDir, "requirement.md");
+  const requirementText = renderIntakeRequirementSnapshot({
+    slug,
+    requirementLevel: route.requirementLevel,
+    intent: value(parsed, "intent", ""),
+    userValue: value(parsed, "value", value(parsed, "user-value", "")),
+    acceptance: value(parsed, "acceptance", ""),
+    nonGoals: value(parsed, "non-goals", value(parsed, "non-goal", "")),
+    riskNote: value(parsed, "risk-note", value(parsed, "risk-notes", "")),
+    impact: value(parsed, "impact", value(parsed, "scope", ""))
+  });
+  const existingRequirement = readText(requirementPath);
+  const canWriteRequirement = !existingRequirement.trim()
+    || hasPlaceholderContent(existingRequirement)
+    || Boolean(parsed.flags.force);
+  if (canWriteRequirement) {
+    writeText(requirementPath, requirementText);
+    writes.push(requirementPath);
+  }
+
+  updateState(root, {
+    active_change: slug,
+    change_type: type,
+    entry_role: role,
+    current_role: role,
+    requirement_level: route.requirementLevel,
+    risk,
+    status: "draft",
+    ui_required: hasUi || configResult.config.ui === "required"
+  });
+
+  io.stdout.write(lines([
+    ok(`Intake recorded: ${slug}`),
+    ok(`Change type: ${type}`),
+    ok(`Entry role: ${role}`),
+    ok(`Requirement level: ${route.requirementLevel}`),
+    ok(`Risk: ${risk.toUpperCase()}`),
+    ok(`Route: ${route.required.join(" -> ")}`),
+    canWriteRequirement ? ok(`Requirement snapshot: ${relative(root, requirementPath)}`) : `! Requirement snapshot already had content; rerun with --force to overwrite.`,
+    writes.length ? `Created/updated:\n${unique(writes).map((file) => `- ${relative(root, file)}`).join("\n")}` : "No files changed.",
+    "",
+    "Next:",
+    `- aiflow next`,
+    `- aiflow prompt --role ${role}`
+  ]));
+  return EXIT.PASS;
+}
+
 function changeStart(parsed, io) {
   const root = io.cwd;
   const topic = parsed.positionals[2];
   if (!topic) return fail(io, EXIT.CONFIG_ERROR, "Usage: aiflow change start <topic>");
   const slug = slugify(topic);
-  const role = value(parsed, "role", "dev");
+  const type = normalizeChangeType(value(parsed, "type", "bugfix"));
+  const role = value(parsed, "from", value(parsed, "role", "dev"));
   const risk = value(parsed, "risk", "s1").toLowerCase();
   const hasUi = Boolean(parsed.flags.ui);
 
+  if (!CHANGE_TYPES.has(type)) return fail(io, EXIT.CONFIG_ERROR, `Invalid change type: ${type}`);
   if (!ROLES.has(role)) return fail(io, EXIT.CONFIG_ERROR, `Invalid role: ${role}`);
   if (!RISKS.has(risk)) return fail(io, EXIT.CONFIG_ERROR, `Invalid risk: ${risk}`);
 
@@ -217,7 +323,19 @@ function changeStart(parsed, io) {
   const changeDir = path.join(root, "openspec", "changes", slug);
   ensureDir(changeDir);
   const writes = [];
+  const route = routeForChange({ type, entryRole: role, risk, uiRequired: hasUi || configResult.config.ui === "required" });
   const files = {
+    "change.yaml": renderChangeYaml({
+      id: slug,
+      type,
+      entryRole: role,
+      currentRole: role,
+      requirementLevel: route.requirementLevel,
+      risk,
+      uiRequired: route.uiRequired
+    }),
+    "route.yaml": renderRouteYaml(route),
+    "requirement.md": templateRequirementSnapshot(slug, route.requirementLevel),
     "proposal.md": templateProposal(slug),
     "design.md": templateDesign(slug),
     "tasks.md": templateTasks(slug),
@@ -237,7 +355,10 @@ function changeStart(parsed, io) {
 
   const state = {
     active_change: slug,
+    change_type: type,
+    entry_role: role,
     current_role: role,
+    requirement_level: route.requirementLevel,
     risk,
     status: "draft",
     ui_required: hasUi || configResult.config.ui === "required",
@@ -248,8 +369,12 @@ function changeStart(parsed, io) {
 
   io.stdout.write(lines([
     ok(`Current change: ${slug}`),
+    ok(`Change type: ${type}`),
+    ok(`Entry role: ${role}`),
     ok(`Current role: ${role}`),
+    ok(`Requirement level: ${route.requirementLevel}`),
     ok(`Risk: ${risk.toUpperCase()}`),
+    ok(`Route: ${route.required.join(" -> ")}`),
     hasUi ? ok("UI validation: required") : ok("UI validation: auto/off"),
     writes.length ? `Created:\n${writes.map((file) => `- ${relative(root, file)}`).join("\n")}` : "Reused existing change files.",
     ...(risk === "s2" || risk === "s3" ? ["", `Next: aiflow change approve ${slug} --risk ${risk}`] : [])
@@ -322,6 +447,133 @@ function commandCheck(parsed, io) {
   return checks.failures.length ? EXIT.CHECK_FAILED : EXIT.PASS;
 }
 
+function commandRoute(parsed, io) {
+  const root = io.cwd;
+  const context = getOptionalContext(root);
+  const type = normalizeChangeType(value(parsed, "type", context.change?.type || "bugfix"));
+  const entryRole = value(parsed, "from", value(parsed, "role", context.change?.entry_role || defaultEntryRole(type)));
+  const risk = value(parsed, "risk", context.state?.risk || "s1").toLowerCase();
+  const uiRequired = Boolean(parsed.flags.ui) || context.state?.ui_required === true || type === "ui_change";
+
+  if (!CHANGE_TYPES.has(type)) return fail(io, EXIT.CONFIG_ERROR, `Invalid change type: ${type}`);
+  if (!ROLES.has(entryRole)) return fail(io, EXIT.CONFIG_ERROR, `Invalid role: ${entryRole}`);
+  if (!RISKS.has(risk)) return fail(io, EXIT.CONFIG_ERROR, `Invalid risk: ${risk}`);
+
+  const route = routeForChange({ type, entryRole, risk, uiRequired });
+  io.stdout.write(renderRouteRecommendation({
+    change: context.state?.active_change || "",
+    type,
+    entryRole,
+    risk,
+    route
+  }));
+  return EXIT.PASS;
+}
+
+function commandNext(parsed, io) {
+  const root = io.cwd;
+  const context = getContext(root);
+  if (!context.ok) return fail(io, EXIT.CONFIG_ERROR, context.error);
+  const checks = collectChecks(root, context);
+  const route = context.route || routeForChange({
+    type: context.change.type,
+    entryRole: context.change.entry_role,
+    risk: context.state.risk,
+    uiRequired: context.state.ui_required
+  });
+  const nextRole = nextRoleInRoute(route.required, context.state.current_role);
+  const missing = [...checks.failures, ...checks.warnings];
+  const suggestions = nextSuggestions(context, route, checks.failures, checks.warnings, nextRole, checks.metadata);
+
+  io.stdout.write(lines([
+    ok(`Current change: ${context.state.active_change}`),
+    ok(`Change type: ${context.change.type}`),
+    ok(`Current role: ${context.state.current_role}`),
+    ok(`Risk: ${context.state.risk.toUpperCase()}`),
+    ok(`Route: ${route.required.join(" -> ")}`),
+    `next_role: ${nextRole || "none"}`,
+    "",
+    "gate_status:",
+    ...renderNextGateStatus(checks.metadata),
+    "",
+    "missing:",
+    ...(missing.length ? missing.map((item) => `- ${item}`) : ["- none"]),
+    "",
+    "recommended_commands:",
+    ...suggestions.map((item) => `- ${item}`)
+  ]));
+  return checks.failures.length ? EXIT.CHECK_FAILED : EXIT.PASS;
+}
+
+function commandContext(parsed, io) {
+  const root = io.cwd;
+  const context = getContext(root);
+  if (!context.ok) return fail(io, EXIT.CONFIG_ERROR, context.error);
+  const role = value(parsed, "role", context.state.current_role);
+  if (!ROLES.has(role)) return fail(io, EXIT.CONFIG_ERROR, `Invalid role: ${role}`);
+
+  const checks = collectChecks(root, context);
+  const content = renderRoleContext({ context, checks, role });
+  const outPath = path.join(root, ".aiflow", "artifacts", "context", `${context.state.active_change}-${role}-context.md`);
+  writeText(outPath, content);
+  io.stdout.write(content);
+  io.stdout.write(`\ncontext_file: ${relative(root, outPath)}\n`);
+  return EXIT.PASS;
+}
+
+function commandPrompt(parsed, io) {
+  const root = io.cwd;
+  const context = getContext(root);
+  if (!context.ok) return fail(io, EXIT.CONFIG_ERROR, context.error);
+  const role = value(parsed, "role", context.state.current_role);
+  if (!ROLES.has(role)) return fail(io, EXIT.CONFIG_ERROR, `Invalid role: ${role}`);
+
+  const checks = collectChecks(root, context);
+  const content = renderRolePrompt({ context, checks, role });
+  const outPath = path.join(root, ".aiflow", "artifacts", "prompts", `${context.state.active_change}-${role}-prompt.md`);
+  writeText(outPath, content);
+  io.stdout.write(content);
+  io.stdout.write(`\nprompt_file: ${relative(root, outPath)}\n`);
+  return EXIT.PASS;
+}
+
+function commandEvidence(parsed, io) {
+  const action = parsed.positionals[1];
+  if (action === "add") return evidenceAdd(parsed, io);
+  if (action === "list") return evidenceList(parsed, io);
+  return fail(io, EXIT.CONFIG_ERROR, "Usage: aiflow evidence add|list");
+}
+
+function evidenceAdd(parsed, io) {
+  const root = io.cwd;
+  const context = getContext(root);
+  if (!context.ok) return fail(io, EXIT.CONFIG_ERROR, context.error);
+  const artifact = value(parsed, "artifact", "");
+  const result = appendEvidence({
+    root,
+    context,
+    type: value(parsed, "type", "validation"),
+    source: value(parsed, "source", "manual"),
+    status: value(parsed, "status", "passed"),
+    command: value(parsed, "command", ""),
+    artifacts: artifact ? artifact.split(",").map((item) => item.trim()).filter(Boolean) : [],
+    note: value(parsed, "note", value(parsed, "reason", "manual evidence recorded"))
+  });
+  io.stdout.write(ok(`Evidence recorded: ${result.id}`) + "\n");
+  io.stdout.write(`- ${relative(root, result.file)}\n`);
+  return EXIT.PASS;
+}
+
+function evidenceList(parsed, io) {
+  const root = io.cwd;
+  const context = getContext(root);
+  if (!context.ok) return fail(io, EXIT.CONFIG_ERROR, context.error);
+  const result = listEvidence({ context });
+  io.stdout.write(result.text);
+  if (exists(result.file)) io.stdout.write(`\n- ${relative(root, result.file)}\n`);
+  return EXIT.PASS;
+}
+
 function commandUi(parsed, io) {
   const action = parsed.positionals[1];
   if (action === "classify") return uiClassify(parsed, io);
@@ -390,9 +642,10 @@ function commandTest(parsed, io) {
   const action = parsed.positionals[1];
   if (action === "prompt") return testPrompt(parsed, io);
   if (action === "generate") return testGenerate(parsed, io);
-  if (action === "approve") return testApprove(parsed, io);
+  if (action === "approve") return testReview(parsed, io, "approve");
+  if (action === "review") return testReview(parsed, io, "review");
   if (action === "run") return testRun(parsed, io);
-  return fail(io, EXIT.CONFIG_ERROR, "Usage: aiflow test prompt|generate|approve|run");
+  return fail(io, EXIT.CONFIG_ERROR, "Usage: aiflow test prompt|generate|review|approve|run");
 }
 
 function testPrompt(parsed, io) {
@@ -426,21 +679,32 @@ async function testGenerate(parsed, io) {
   return result.code;
 }
 
-function testApprove(parsed, io) {
+function testReview(parsed, io, action) {
   const root = io.cwd;
   const context = getContext(root);
   if (!context.ok) return fail(io, EXIT.CONFIG_ERROR, context.error);
   const scenarioFile = path.join(context.changeDir, "test-scenarios.yaml");
-  if (!exists(scenarioFile)) return fail(io, EXIT.CONFIG_ERROR, "No test-scenarios.yaml found for the active change. Run aiflow test generate first.");
+  const intentFile = path.join(context.changeDir, "test-intent.yaml");
+  if (!exists(scenarioFile) && !exists(intentFile)) {
+    return fail(io, EXIT.CONFIG_ERROR, "No test-intent.yaml or test-scenarios.yaml found for the active change. Run aiflow test generate first.");
+  }
+  const review = reviewTestIntent({
+    root,
+    context,
+    reason: value(parsed, "reason", action === "approve" ? "human reviewed test scenarios" : "human reviewed test intent")
+  });
+  if (!review.ok) return fail(io, EXIT.CONFIG_ERROR, review.error);
   appendApproval(context.changeDir, {
-    kind: "Test Scenario Approval",
+    kind: action === "approve" ? "Test Scenario Approval" : "Test Intent Approval",
     risk_level: context.state.risk.toUpperCase(),
-    scope: value(parsed, "scope-text", "AI generated test scenarios"),
-    reason: value(parsed, "reason", "human reviewed test scenarios"),
+    scope: value(parsed, "scope-text", "AI generated test intent and scenarios"),
+    reason: value(parsed, "reason", action === "approve" ? "human reviewed test scenarios" : "human reviewed test intent"),
     command: `aiflow ${parsed.raw.join(" ")}`,
     commit: currentCommit(root)
   });
-  io.stdout.write(ok(`Test Scenario Approval recorded for ${context.state.active_change}`) + "\n");
+  const label = action === "approve" ? "Test Scenario Approval" : "Test Intent Review";
+  io.stdout.write(ok(`${label} recorded for ${context.state.active_change}`) + "\n");
+  io.stdout.write(`- ${relative(root, review.intentPath)}\n`);
   return EXIT.PASS;
 }
 
@@ -452,6 +716,7 @@ function testRun(parsed, io) {
     root,
     context,
     url: value(parsed, "url", ""),
+    command: value(parsed, "command", ""),
     scenarioFile: value(parsed, "scenario", ""),
     reviewed: Boolean(parsed.flags.reviewed)
   });
@@ -665,19 +930,523 @@ function getContext(root) {
   if (!active) return { ok: false, error: "No active change found. Run aiflow change start <topic>." };
   const changeDir = path.join(root, "openspec", "changes", active);
   if (!exists(changeDir)) return { ok: false, error: `Active change directory not found: ${relative(root, changeDir)}` };
+  const changeMeta = readChangeMeta(changeDir, state);
+  const route = readRouteMeta(changeDir) || routeForChange({
+    type: changeMeta.type,
+    entryRole: changeMeta.entry_role,
+    risk: state.risk || changeMeta.risk || "s1",
+    uiRequired: state.ui_required === true || state.ui_required === "true"
+  });
   return {
     ok: true,
     root,
     config: configResult.config,
+    change: changeMeta,
+    route,
     state: {
       active_change: active,
-      current_role: state.current_role || configResult.config.roles.current || "dev",
-      risk: state.risk || "s1",
+      change_type: state.change_type || changeMeta.type,
+      entry_role: state.entry_role || changeMeta.entry_role,
+      current_role: state.current_role || changeMeta.current_role || configResult.config.roles.current || "dev",
+      requirement_level: state.requirement_level || changeMeta.requirement_level,
+      risk: state.risk || changeMeta.risk || "s1",
       status: state.status || "draft",
       ui_required: state.ui_required === true || state.ui_required === "true"
     },
     changeDir
   };
+}
+
+function getOptionalContext(root) {
+  const context = getContext(root);
+  return context.ok ? context : {};
+}
+
+function readChangeMeta(changeDir, state = {}) {
+  const parsed = parseFlatYaml(readText(path.join(changeDir, "change.yaml")));
+  const type = normalizeChangeType(parsed.type || state.change_type || "bugfix");
+  return {
+    id: parsed.id || state.active_change || path.basename(changeDir),
+    type: CHANGE_TYPES.has(type) ? type : "bugfix",
+    entry_role: parsed.entry_role || state.entry_role || state.current_role || defaultEntryRole(type),
+    current_role: parsed.current_role || state.current_role || defaultEntryRole(type),
+    requirement_level: parsed.requirement_level || state.requirement_level || requirementLevelForType(type),
+    risk: String(parsed.risk || state.risk || "s1").toLowerCase(),
+    ui_required: parsed.ui_required === true || parsed.ui_required === "true" || state.ui_required === true
+  };
+}
+
+function readRouteMeta(changeDir) {
+  const text = readText(path.join(changeDir, "route.yaml"));
+  if (!text.trim()) return null;
+  return {
+    requirementLevel: matchYamlScalar(text, "requirement_level") || "lightweight",
+    uiRequired: matchYamlScalar(text, "ui_required") === "true",
+    required: matchYamlList(text, "required"),
+    optional: matchYamlList(text, "optional"),
+    gates: matchYamlMap(text, "gates")
+  };
+}
+
+function routeForChange({ type, entryRole, risk, uiRequired }) {
+  const normalizedType = normalizeChangeType(type);
+  const highRisk = risk === "s2" || risk === "s3";
+  const policies = {
+    feature_request: {
+      entryRole: "pm",
+      requirementLevel: "full",
+      required: ["pm", "architect", "dev", "qa", "release"],
+      optional: ["ui"],
+      gates: {
+        requirement_snapshot: "required",
+        architecture_review: "required",
+        validation: "required",
+        ui_evidence: "optional",
+        release_record: "required"
+      }
+    },
+    bugfix: {
+      entryRole: "dev",
+      requirementLevel: "lightweight",
+      required: ["dev", "qa"],
+      optional: ["architect", "release"],
+      gates: {
+        requirement_snapshot: "required",
+        architecture_review: "optional",
+        validation: "required",
+        ui_evidence: uiRequired ? "required" : "not_applicable",
+        release_record: "optional"
+      }
+    },
+    refactor: {
+      entryRole: "dev",
+      requirementLevel: "lightweight",
+      required: ["architect", "dev", "qa"],
+      optional: ["release"],
+      gates: {
+        requirement_snapshot: "required",
+        architecture_review: "required",
+        validation: "required",
+        ui_evidence: "not_applicable",
+        release_record: "optional"
+      }
+    },
+    docs: {
+      entryRole: "dev",
+      requirementLevel: "lightweight",
+      required: ["dev"],
+      optional: ["qa"],
+      gates: {
+        requirement_snapshot: "required",
+        architecture_review: "not_applicable",
+        validation: "required",
+        ui_evidence: "not_applicable",
+        release_record: "optional"
+      }
+    },
+    test: {
+      entryRole: "qa",
+      requirementLevel: "lightweight",
+      required: ["qa"],
+      optional: ["dev", "architect"],
+      gates: {
+        requirement_snapshot: "required",
+        architecture_review: "optional",
+        validation: "required",
+        test_intent_review: "required",
+        ui_evidence: uiRequired ? "required" : "optional",
+        release_record: "optional"
+      }
+    },
+    ui_change: {
+      entryRole: "pm",
+      requirementLevel: "full",
+      required: ["pm", "ui", "dev", "qa"],
+      optional: ["architect", "release"],
+      gates: {
+        requirement_snapshot: "required",
+        architecture_review: "optional",
+        validation: "required",
+        ui_evidence: "required",
+        release_record: "optional"
+      }
+    },
+    release: {
+      entryRole: "release",
+      requirementLevel: "release_snapshot",
+      required: ["qa", "release"],
+      optional: ["pm"],
+      gates: {
+        requirement_snapshot: "required",
+        validation: "required",
+        delivery_approval: "required",
+        release_record: "required"
+      }
+    }
+  };
+  const base = policies[normalizedType] || policies.bugfix;
+  let required = [...base.required];
+  const optional = [...base.optional];
+  if (uiRequired && !required.includes("ui") && normalizedType !== "release") {
+    required = required.includes("pm") ? insertAfter(required, "pm", "ui") : insertBefore(required, "qa", "ui");
+  }
+  if (highRisk && !required.includes("architect") && normalizedType !== "release") required = insertBefore(required, "dev", "architect");
+  if (highRisk && !required.includes("release")) required.push("release");
+  if (entryRole && !required.includes(entryRole) && ROLES.has(entryRole)) required = [entryRole, ...required];
+  const gates = { ...base.gates };
+  if (highRisk) {
+    gates.risk_approval = "required";
+    gates.scope_approval = "required";
+    gates.design_approval = "required";
+    gates.architecture_review = gates.architecture_review === "not_applicable" ? "optional" : "required";
+  }
+  if (uiRequired) gates.ui_evidence = "required";
+  return {
+    type: normalizedType,
+    entryRole: entryRole || base.entryRole,
+    requirementLevel: base.requirementLevel,
+    risk,
+    uiRequired: Boolean(uiRequired),
+    required: unique(required),
+    optional: unique(optional.filter((role) => !required.includes(role))),
+    gates
+  };
+}
+
+function renderChangeYaml({ id, type, entryRole, currentRole, requirementLevel, risk, uiRequired }) {
+  return `id: ${id}
+type: ${type}
+entry_role: ${entryRole}
+current_role: ${currentRole}
+requirement_level: ${requirementLevel}
+risk: ${risk.toUpperCase()}
+ui_required: ${Boolean(uiRequired)}
+delivery_status: draft
+`;
+}
+
+function renderRouteYaml(route) {
+  return `type: ${route.type}
+entry_role: ${route.entryRole}
+requirement_level: ${route.requirementLevel}
+risk: ${String(route.risk || "s1").toUpperCase()}
+ui_required: ${Boolean(route.uiRequired)}
+
+required:
+${route.required.map((role) => `  - ${role}`).join("\n")}
+
+optional:
+${route.optional.length ? route.optional.map((role) => `  - ${role}`).join("\n") : "  - none"}
+
+gates:
+${Object.entries(route.gates).map(([key, val]) => `  ${key}: ${val}`).join("\n")}
+`;
+}
+
+function renderRouteRecommendation({ change, type, entryRole, risk, route }) {
+  return `change: ${change || "preview"}
+type: ${type}
+entry_role: ${entryRole}
+risk: ${risk.toUpperCase()}
+requirement_level: ${route.requirementLevel}
+route:
+  required:
+${route.required.map((role) => `    - ${role}`).join("\n")}
+  optional:
+${route.optional.length ? route.optional.map((role) => `    - ${role}`).join("\n") : "    - none"}
+gates:
+${Object.entries(route.gates).map(([key, val]) => `  ${key}: ${val}`).join("\n")}
+`;
+}
+
+function renderRoleContext({ context, checks, role }) {
+  const roleFile = path.join(context.changeDir, `${role}.md`);
+  return `# aiflow Context Package
+
+- change: ${context.state.active_change}
+- type: ${context.change.type}
+- requested_role: ${role}
+- current_role: ${context.state.current_role}
+- risk: ${context.state.risk.toUpperCase()}
+- requirement_level: ${context.change.requirement_level}
+- route: ${context.route.required.join(" -> ")}
+
+## Gates
+
+${Object.entries(context.route.gates).map(([key, val]) => `- ${key}: ${val}`).join("\n")}
+
+## Check Status
+
+- result: ${checks.failures.length ? "blocked" : "pass"}
+- failures: ${checks.failures.length ? checks.failures.join("; ") : "none"}
+- warnings: ${checks.warnings.length ? checks.warnings.join("; ") : "none"}
+
+## Requirement Snapshot
+
+${readText(path.join(context.changeDir, "requirement.md")) || "No requirement snapshot recorded."}
+
+## Role Notes
+
+${readText(roleFile) || `No ${role}.md content recorded.`}
+
+## Tasks
+
+${readText(path.join(context.changeDir, "tasks.md")) || "No tasks recorded."}
+`;
+}
+
+function renderRolePrompt({ context, checks, role }) {
+  const route = context.route.required.join(" -> ");
+  return `# Prompt for ${role}
+
+You are working inside the aiflow project workflow for this change.
+
+## Change
+
+- id: ${context.state.active_change}
+- type: ${context.change.type}
+- entry_role: ${context.change.entry_role}
+- current_role: ${context.state.current_role}
+- requested_role: ${role}
+- risk: ${context.state.risk.toUpperCase()}
+- requirement_level: ${context.change.requirement_level}
+- route: ${route}
+
+## Operating Rules
+
+- Treat role files as governance records, not autonomous agent execution.
+- Keep changes scoped to this change.
+- AI may draft intent, scenarios, and suggestions, but final validation requires harness evidence.
+- AI output is not final acceptance evidence.
+- Release, merge, publish, and archive must remain explicit human-triggered actions.
+
+## Current Missing Items
+
+${checks.failures.length ? checks.failures.map((item) => `- ${item}`).join("\n") : "- none"}
+
+## Task
+
+Continue the ${role} responsibility for this change. Update the relevant role record, preserve existing project rules, and provide concrete validation evidence or next-step recommendations.
+  `;
+}
+
+function renderIntakeRequirementSnapshot({ slug, requirementLevel, intent, userValue, acceptance, nonGoals, riskNote, impact }) {
+  return `# Requirement Snapshot: ${slug}
+
+requirement_level: ${requirementLevel}
+source: intake
+
+## Change Intent
+
+${intent || "TODO"}
+
+## User Value
+
+${userValue || "TODO"}
+
+## Acceptance Criteria
+
+${renderMarkdownList(acceptance)}
+
+## Non-goals
+
+${renderMarkdownList(nonGoals)}
+
+## Risk
+
+${riskNote || "TODO"}
+
+## Impact Scope
+
+${impact || "TODO"}
+`;
+}
+
+function renderMarkdownList(value) {
+  const items = splitListInput(value);
+  return items.length ? items.map((item) => `- ${item}`).join("\n") : "- TODO";
+}
+
+function splitListInput(value) {
+  return String(value || "")
+    .split(/\s*(?:\||;)\s*/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function hasPlaceholderContent(text) {
+  return /\b(?:TODO|TBD)\b|待补充/i.test(String(text || ""));
+}
+
+function nextRoleInRoute(required, currentRole) {
+  const index = required.indexOf(currentRole);
+  if (index === -1) return required[0] || "";
+  return required[index + 1] || "";
+}
+
+function renderNextGateStatus(metadata = {}) {
+  const pairs = [
+    ["requirement_snapshot", metadata.requirement_snapshot_required, metadata.requirement_snapshot_recorded],
+    ["architecture_review", metadata.architecture_review_required, metadata.architecture_review_recorded],
+    ["validation_evidence", metadata.validation_evidence_required, metadata.validation_evidence_confirmed],
+    ["ui_evidence", metadata.ui_required, metadata.ui_validated],
+    ["risk_approval", metadata.risk_approval_required, metadata.risk_confirmed],
+    ["scope_approval", metadata.scope_required, metadata.scope_approved],
+    ["design_approval", metadata.design_required, metadata.design_approved],
+    ["test_intent_review", metadata.test_intent_human_review_required, metadata.test_intent_human_reviewed],
+    ["delivery_approval", metadata.delivery_approval_required, metadata.delivery_approved],
+    ["release_record", metadata.release_record_required, metadata.release_record_recorded]
+  ];
+
+  return pairs.flatMap(([name, required, satisfied]) => [
+    `  ${name}_required: ${Boolean(required)}`,
+    `  ${name}_satisfied: ${Boolean(satisfied)}`
+  ]);
+}
+
+function nextSuggestions(context, route, failures, warnings, nextRole, metadata = {}) {
+  const missing = [...failures, ...warnings];
+  const suggestions = [];
+  if (failures.length) suggestions.push("aiflow check");
+  if (missing.some((item) => item.includes("requirement snapshot"))) {
+    suggestions.push(`edit openspec/changes/${context.state.active_change}/requirement.md`);
+  }
+  if (missing.some((item) => item.includes("requirement source"))) {
+    suggestions.push(`edit openspec/changes/${context.state.active_change}/${context.state.current_role}.md`);
+  }
+  if (missing.some((item) => item.includes("architecture review"))) {
+    suggestions.push(`edit openspec/changes/${context.state.active_change}/architect.md`);
+  }
+  if (missing.some((item) => item.includes("validation record"))) {
+    suggestions.push(`edit openspec/changes/${context.state.active_change}/${context.state.current_role}.md`);
+  }
+  if (missing.some((item) => item.includes("validation evidence"))) {
+    suggestions.push("aiflow test run --command <command>");
+    suggestions.push("aiflow evidence add --type validation --source manual --status passed --artifact <file>");
+  }
+  if (missing.some((item) => item.includes("test scenarios require human_review_required"))) {
+    suggestions.push(`edit openspec/changes/${context.state.active_change}/test-scenarios.yaml`);
+  }
+  if (missing.some((item) => item.includes("test intent requires human_review_required"))) {
+    suggestions.push(`edit openspec/changes/${context.state.active_change}/test-intent.yaml`);
+  }
+  if (missing.some((item) => item.includes("test intent requires human review"))) {
+    suggestions.push("aiflow test review");
+  }
+  if (missing.some((item) => item.includes("Risk Approval"))) {
+    suggestions.push(`aiflow change approve ${context.state.active_change} --risk ${context.state.risk}`);
+  }
+  if (missing.some((item) => item.includes("Scope Approval"))) {
+    suggestions.push(`aiflow change approve ${context.state.active_change} --scope`);
+  }
+  if (missing.some((item) => item.includes("Design Approval"))) {
+    suggestions.push(`aiflow change approve ${context.state.active_change} --design`);
+  }
+  if (missing.some((item) => item.includes("UI Brief"))) {
+    suggestions.push("edit .aiflow/artifacts/ui/ui-brief.md");
+  }
+  if (route.gates.ui_evidence === "required" || metadata.ui_required) suggestions.push("aiflow ui classify && aiflow ui verify --url <url>");
+  if (nextRole) suggestions.push(`aiflow context --role ${nextRole}`);
+  if (nextRole) suggestions.push(`aiflow prompt --role ${nextRole}`);
+  if (!failures.length && (metadata.delivery_approval_required || route.gates.release_record === "required")) {
+    if (metadata.delivery_approval_required && !metadata.delivery_approved) suggestions.push("aiflow delivery approve");
+    if (!metadata.delivery_prepared) suggestions.push("aiflow delivery prepare");
+    if (metadata.delivery_approved && metadata.delivery_prepared && !metadata.release_record_recorded) {
+      suggestions.push(`aiflow delivery record ${context.state.active_change} --action release --ref <value>`);
+    }
+  }
+  if (!suggestions.length) suggestions.push("aiflow check");
+  return unique(suggestions);
+}
+
+function defaultEntryRole(type) {
+  return {
+    feature_request: "pm",
+    bugfix: "dev",
+    refactor: "dev",
+    docs: "dev",
+    test: "qa",
+    ui_change: "pm",
+    release: "release"
+  }[normalizeChangeType(type)] || "dev";
+}
+
+function requirementLevelForType(type) {
+  if (type === "feature_request" || type === "ui_change") return "full";
+  if (type === "release") return "release_snapshot";
+  return "lightweight";
+}
+
+function normalizeChangeType(type) {
+  const value = String(type || "").trim().toLowerCase().replace(/[-\s]+/g, "_");
+  if (value === "feature") return "feature_request";
+  if (value === "ui") return "ui_change";
+  if (value === "tests") return "test";
+  return value || "bugfix";
+}
+
+function parseFlatYaml(text) {
+  const result = {};
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_-]*):\s*(.+)$/);
+    if (match) result[match[1]] = match[2].trim();
+  }
+  return result;
+}
+
+function matchYamlScalar(text, key) {
+  const match = String(text || "").match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
+  return match ? match[1].trim() : "";
+}
+
+function matchYamlList(text, key) {
+  const lines = String(text || "").split(/\r?\n/);
+  const values = [];
+  let inList = false;
+  for (const line of lines) {
+    if (line.match(new RegExp(`^${key}:\\s*$`))) {
+      inList = true;
+      continue;
+    }
+    if (inList && /^[A-Za-z_][A-Za-z0-9_-]*:\s*/.test(line)) break;
+    const item = line.match(/^\s+-\s*(.+)$/);
+    if (inList && item && item[1] !== "none") values.push(item[1].trim());
+  }
+  return values;
+}
+
+function matchYamlMap(text, key) {
+  const lines = String(text || "").split(/\r?\n/);
+  const result = {};
+  let inMap = false;
+  for (const line of lines) {
+    if (line.match(new RegExp(`^${key}:\\s*$`))) {
+      inMap = true;
+      continue;
+    }
+    if (inMap && /^[A-Za-z_][A-Za-z0-9_-]*:\s*/.test(line)) break;
+    const item = line.match(/^\s+([A-Za-z_][A-Za-z0-9_-]*):\s*(.+)$/);
+    if (inMap && item) result[item[1]] = item[2].trim();
+  }
+  return result;
+}
+
+function insertAfter(items, after, item) {
+  if (items.includes(item)) return items;
+  const index = items.indexOf(after);
+  if (index === -1) return [item, ...items];
+  return [...items.slice(0, index + 1), item, ...items.slice(index + 1)];
+}
+
+function insertBefore(items, before, item) {
+  if (items.includes(item)) return items;
+  const index = items.indexOf(before);
+  if (index === -1) return [item, ...items];
+  return [...items.slice(0, index), item, ...items.slice(index)];
+}
+
+function unique(items) {
+  return [...new Set(items.filter(Boolean))];
 }
 
 function renderHandoff(context, checks) {
@@ -783,10 +1552,17 @@ Usage:
   aiflow help
   aiflow init [--mode auto|new|legacy] [--strictness light|standard|strict] [--ui auto|required|off]
   aiflow doctor
-  aiflow change start <topic> --role dev --risk s1 [--ui]
+  aiflow change start <topic> [--type bugfix] [--from dev] [--role dev] --risk s1 [--ui]
   aiflow change status
   aiflow change list
   aiflow change approve <change> --scope|--design|--risk s2
+  aiflow intake <topic> [--type bugfix] [--from dev] [--risk s1] [--intent text] [--value text] [--acceptance text]
+  aiflow route [--type bugfix] [--from dev] [--risk s1] [--ui]
+  aiflow next
+  aiflow context [--role dev]
+  aiflow prompt [--role dev]
+  aiflow evidence add [--type validation] [--source manual] [--status passed] [--artifact file] [--command command] [--note text]
+  aiflow evidence list
   aiflow check [--ci] [--base main|origin/main] [--staged] [--since HEAD~1]
   aiflow ui classify
   aiflow ui verify [--url http://localhost:3000]
@@ -794,7 +1570,9 @@ Usage:
   aiflow ui deviation list
   aiflow test prompt
   aiflow test generate [--ai] [--requirements file] [--page file] [--ui-brief file] [--constraints file] [--out file]
+  aiflow test review [--reason text]
   aiflow test approve [--reason text]
+  aiflow test run --command "npm test"
   aiflow test run --url http://localhost:3000 [--scenario file] [--reviewed]
   aiflow handoff
   aiflow delivery approve

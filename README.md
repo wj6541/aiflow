@@ -11,9 +11,10 @@ CLI-first AI 交付流程工具，用于把 OpenSpec、AI agent 规则、CI、UI
 ```bash
 npx aiflow-kit init
 npx aiflow doctor
-npx aiflow change start fix-login --role dev --risk s1
+npx aiflow intake fix-login --type bugfix --from dev --risk s1 --intent "Fix the login failure"
+npx aiflow next
+npx aiflow context --role dev
 npx aiflow check
-npx aiflow handoff
 ```
 
 想把 CLI 固定到项目依赖里，再执行：
@@ -35,10 +36,11 @@ npm i -D aiflow-kit
 
 ✗ Missing requirement source
 ✗ Missing validation record
+! Missing validation evidence
 
 Next:
 - Add requirement source to openspec/changes/fix-login/dev.md
-- Record validation result before handoff
+- Record validation result and link harness or manual evidence before delivery
 ```
 
 ## 它检查什么
@@ -85,10 +87,17 @@ aiflow version
 aiflow help
 aiflow init [--mode auto|new|legacy] [--strictness light|standard|strict] [--ui auto|required|off]
 aiflow doctor
-aiflow change start <topic> --role dev --risk s1 [--ui]
+aiflow change start <topic> [--type bugfix] [--from dev] [--role dev] --risk s1 [--ui]
 aiflow change status
 aiflow change list
 aiflow change approve <change> --scope|--design|--risk s2
+aiflow intake <topic> [--type bugfix] [--from dev] [--risk s1] [--intent text] [--value text] [--acceptance text]
+aiflow route [--type bugfix] [--from dev] [--risk s1] [--ui]
+aiflow next
+aiflow context [--role dev]
+aiflow prompt [--role dev]
+aiflow evidence add [--type validation] [--source manual] [--status passed] [--artifact file] [--command command] [--note text]
+aiflow evidence list
 aiflow check [--ci] [--base main|origin/main] [--staged] [--since HEAD~1]
 aiflow ui classify
 aiflow ui verify [--url http://localhost:3000]
@@ -96,7 +105,9 @@ aiflow ui deviation add --description <text> --reason <text> [--accepted-by name
 aiflow ui deviation list
 aiflow test prompt
 aiflow test generate [--ai] [--requirements file] [--page file] [--ui-brief file] [--constraints file] [--out file]
+aiflow test review [--reason text]
 aiflow test approve [--reason text]
+aiflow test run --command "npm test"
 aiflow test run --url http://localhost:3000 [--scenario file] [--reviewed]
 aiflow handoff
 aiflow delivery approve
@@ -211,6 +222,7 @@ aiflow test generate --ai --requirements req.md --page page.md --ui-brief brief.
 
 ```text
 .aiflow/artifacts/tests/<change>-test-generation-prompt.md
+openspec/changes/<change>/test-intent.yaml
 openspec/changes/<change>/test-scenarios.yaml
 ```
 
@@ -219,12 +231,14 @@ openspec/changes/<change>/test-scenarios.yaml
 ```yaml
 source: ai_generated
 human_review_required: true
+human_reviewed: false
 ```
 
 AI 场景生成后，需要显式确认再执行页面自动化：
 
 ```bash
-aiflow test approve --reason "QA reviewed selectors and assertions"
+aiflow test review --reason "QA reviewed selectors and assertions"
+aiflow test run --command "npm test"
 aiflow test run --url http://localhost:3000
 ```
 
@@ -232,8 +246,12 @@ aiflow test run --url http://localhost:3000
 
 ```text
 .aiflow/artifacts/tests/scenario-results.json
+.aiflow/artifacts/tests/harness-result.json
+.aiflow/artifacts/tests/harness-result.yaml
 .aiflow/artifacts/tests/screenshots/
 ```
+
+`harness-result.yaml/json` 是 Harness evidence。`aiflow check` 会读取它并报告 `harness_result_exists`、`harness_result_status`、`harness_result_passed`；如果已有 harness evidence 明确失败，`check` 会阻止通过。
 
 发布前运行：
 
@@ -361,6 +379,12 @@ standard / L1-L2   -> required records are failures, role boundary is warning
 strict / L3        -> required records and role boundary violations are failures
 ```
 
+For route gates, a required requirement snapshot is enforced as a warning in light/standard projects and as a failure in strict/L3 projects. Dev can start lightweight changes directly, but strict delivery checks still require concrete intent, value, acceptance criteria, non-goals, risk, and impact scope.
+
+Required architecture review is checked from recorded role/design artifacts or explicit approval. It is not automatic Architect execution.
+
+Release route gates are surfaced as `check` metadata and `next` recommendations for explicit human commands. They do not trigger release, merge, publish, or archive.
+
 ## License（许可证）
 
 MIT
@@ -378,9 +402,10 @@ CLI-first workflow layer for spec-driven, AI-assisted team software delivery.
 ```bash
 npx aiflow-kit init
 npx aiflow doctor
-npx aiflow change start fix-login --role dev --risk s1
+npx aiflow intake fix-login --type bugfix --from dev --risk s1 --intent "Fix the login failure"
+npx aiflow next
+npx aiflow context --role dev
 npx aiflow check
-npx aiflow handoff
 ```
 
 To pin the CLI as a project dev dependency, run:
@@ -433,10 +458,17 @@ aiflow version
 aiflow help
 aiflow init [--mode auto|new|legacy] [--strictness light|standard|strict] [--ui auto|required|off]
 aiflow doctor
-aiflow change start <topic> --role dev --risk s1 [--ui]
+aiflow change start <topic> [--type bugfix] [--from dev] [--role dev] --risk s1 [--ui]
 aiflow change status
 aiflow change list
 aiflow change approve <change> --scope|--design|--risk s2
+aiflow intake <topic> [--type bugfix] [--from dev] [--risk s1] [--intent text] [--value text] [--acceptance text]
+aiflow route [--type bugfix] [--from dev] [--risk s1] [--ui]
+aiflow next
+aiflow context [--role dev]
+aiflow prompt [--role dev]
+aiflow evidence add [--type validation] [--source manual] [--status passed] [--artifact file] [--command command] [--note text]
+aiflow evidence list
 aiflow check [--ci] [--base main|origin/main] [--staged] [--since HEAD~1]
 aiflow ui classify
 aiflow ui verify [--url http://localhost:3000]
@@ -444,7 +476,9 @@ aiflow ui deviation add --description <text> --reason <text> [--accepted-by name
 aiflow ui deviation list
 aiflow test prompt
 aiflow test generate [--ai] [--requirements file] [--page file] [--ui-brief file] [--constraints file] [--out file]
+aiflow test review [--reason text]
 aiflow test approve [--reason text]
+aiflow test run --command "npm test"
 aiflow test run --url http://localhost:3000 [--scenario file] [--reviewed]
 aiflow handoff
 aiflow delivery approve
@@ -585,6 +619,12 @@ legacy L0 / light  -> missing records are warnings
 standard / L1-L2   -> required records are failures, role boundary is warning
 strict / L3        -> required records and role boundary violations are failures
 ```
+
+For route gates, a required requirement snapshot is a warning in light/standard projects and a failure in strict/L3 projects. Dev can start lightweight changes directly, but strict delivery checks still require concrete intent, value, acceptance criteria, non-goals, risk, and impact scope.
+
+Required architecture review is checked from recorded role/design artifacts or explicit approval. It is not automatic Architect execution.
+
+Release route gates are surfaced as `check` metadata and `next` recommendations for explicit human commands. They do not trigger release, merge, publish, or archive.
 
 ## License
 

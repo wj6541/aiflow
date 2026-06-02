@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { ROLE_FILE_ALLOW, ROLES } from "./constants.js";
 import { loadConfig } from "./config.js";
+import { readEvidenceSummary } from "./evidence.js";
 import { exists, normalizePath, readText } from "./fs-utils.js";
 import { gitLinesResult, isGitRepo, touchedWorkspacePackages } from "./project.js";
 
@@ -12,18 +13,36 @@ export function collectChecks(root, context, changedFiles = []) {
   const role = context.state.current_role;
   const roleFile = path.join(context.changeDir, `${role}.md`);
   const roleText = readText(roleFile);
+  const architectText = readText(path.join(context.changeDir, "architect.md"));
+  const designText = readText(path.join(context.changeDir, "design.md"));
   const tasksText = readText(path.join(context.changeDir, "tasks.md"));
+  const requirementText = readText(path.join(context.changeDir, "requirement.md"));
   const approvals = readText(path.join(context.changeDir, "approvals.md"));
   const releaseText = readText(path.join(context.changeDir, "release.md"));
   const testScenariosText = readText(path.join(context.changeDir, "test-scenarios.yaml"));
+  const testIntentText = readText(path.join(context.changeDir, "test-intent.yaml"));
+  const harnessResult = readHarnessResult(root, context);
+  const evidence = readEvidenceSummary(context.changeDir);
   const uiMeta = readUiMetadata(context.changeDir);
   const riskApprovalRequired = context.state.risk === "s2" || context.state.risk === "s3";
   const sourceRecorded = hasFilledField(roleText, ["Requirement source", "需求来源"]);
   const validationRecorded = hasFilledField(`${roleText}\n${tasksText}`, ["Validation", "验证"]);
+  const aiOnlyValidationClaim = hasAiOnlyValidationClaim(`${roleText}\n${tasksText}`);
   const riskRecorded = hasFilledField(roleText, ["Risk", "风险"]);
+  const requirementSnapshotRequired = routeRequiresRequirementSnapshot(context);
+  const requirementSnapshotRecorded = hasRequirementSnapshot(requirementText);
+  const architectureReviewRequired = routeRequiresGate(context, "architecture_review");
+  const architectureReviewRecorded = hasArchitectureReview({ architectText, designText, approvals });
+  const validationEvidenceRequired = routeRequiresGate(context, "validation");
+  const validationEvidenceConfirmed = validationRecorded
+    && (harnessResult.status === "passed" || (evidence.exists && evidence.passed && !evidence.failed));
   const scopeApprovalRecorded = approvals.includes("Scope Approval");
   const designApprovalRecorded = approvals.includes("Design Approval");
   const riskApprovalRecorded = approvals.includes("Risk Approval");
+  const releaseRecordRequired = routeRequiresGate(context, "release_record");
+  const deliveryApprovalRequired = routeRequiresGate(context, "delivery_approval") || releaseRecordRequired;
+  const deliveryApproved = approvals.includes("Delivery Approval");
+  const releaseRecordRecorded = /Delivery Action:\s*(mr|merge|release)/i.test(approvals);
   const uiCheckRequired = policy.requireUiEvidence || context.state.ui_required || uiMeta.ui_source !== "none";
   const uiEvidence = collectUiEvidence(context.changeDir, root);
   const uiEvidenceRecorded = uiEvidence.valid;
@@ -32,6 +51,12 @@ export function collectChecks(root, context, changedFiles = []) {
   const deliveryPrepared = releaseText.includes("# Delivery Prepare");
   const aiTestScenariosPresent = testScenariosText.includes("source: ai_generated");
   const aiTestScenariosReviewRequired = !aiTestScenariosPresent || /human_review_required:\s*true\b/.test(testScenariosText);
+  const aiTestIntentPresent = testIntentText.includes("source: ai_generated");
+  const aiTestIntentReviewRequired = !aiTestIntentPresent || /human_review_required:\s*true\b/.test(testIntentText);
+  const aiTestIntentReviewed = !aiTestIntentPresent
+    || /human_reviewed:\s*true\b/.test(testIntentText)
+    || approvals.includes("Test Intent Approval")
+    || approvals.includes("Test Scenario Approval");
   const metadata = {
     scope_required: riskApprovalRequired,
     scope_approved: !riskApprovalRequired || scopeApprovalRecorded,
@@ -39,8 +64,14 @@ export function collectChecks(root, context, changedFiles = []) {
     design_approved: !riskApprovalRequired || designApprovalRecorded,
     risk_approval_required: riskApprovalRequired,
     risk_confirmed: riskRecorded && (!riskApprovalRequired || riskApprovalRecorded),
+    requirement_snapshot_required: requirementSnapshotRequired,
+    requirement_snapshot_recorded: requirementSnapshotRecorded,
+    architecture_review_required: architectureReviewRequired,
+    architecture_review_recorded: architectureReviewRecorded,
     requirement_source_recorded: sourceRecorded,
     validation_recorded: validationRecorded,
+    validation_evidence_required: validationEvidenceRequired,
+    validation_evidence_confirmed: validationEvidenceConfirmed,
     ui_required: uiCheckRequired,
     ui_brief_required: uiBriefRequired,
     ui_validated: !uiCheckRequired || (uiEvidenceRecorded && uiBriefCompleted),
@@ -49,6 +80,18 @@ export function collectChecks(root, context, changedFiles = []) {
     ui_screenshot_evidence: uiEvidence.hasScreenshots,
     ui_non_ui_explained: uiEvidence.hasNonUiExplanation,
     test_scenarios_human_review_required: aiTestScenariosReviewRequired,
+    test_intent_exists: Boolean(testIntentText.trim()),
+    test_intent_human_review_required: aiTestIntentReviewRequired,
+    test_intent_human_reviewed: aiTestIntentReviewed,
+    harness_result_exists: harnessResult.exists,
+    harness_result_status: harnessResult.status || "missing",
+    harness_result_passed: harnessResult.status === "passed",
+    validation_evidence_linked: evidence.exists,
+    validation_evidence_passed: evidence.passed && !evidence.failed,
+    delivery_approval_required: deliveryApprovalRequired,
+    delivery_approved: deliveryApproved,
+    release_record_required: releaseRecordRequired,
+    release_record_recorded: releaseRecordRecorded,
     delivery_prepared: deliveryPrepared
   };
 
@@ -62,9 +105,21 @@ export function collectChecks(root, context, changedFiles = []) {
   if (policy.requireValidation && !validationRecorded) {
     addFinding(policy.validationSeverity, failures, warnings, "Missing validation record");
   }
+  if (validationEvidenceRequired && validationRecorded && !validationEvidenceConfirmed) {
+    addFinding(policy.validationEvidenceSeverity, failures, warnings, "Missing validation evidence");
+  }
+  if (validationRecorded && aiOnlyValidationClaim && !harnessResult.exists && !evidence.exists) {
+    failures.push("AI validation claim is not final evidence");
+  }
 
   if (policy.requireRisk && !riskRecorded) {
     addFinding(policy.riskSeverity, failures, warnings, "Missing risk record");
+  }
+  if (requirementSnapshotRequired && !requirementSnapshotRecorded) {
+    addFinding(policy.requirementSnapshotSeverity, failures, warnings, "Missing requirement snapshot");
+  }
+  if (architectureReviewRequired && !architectureReviewRecorded) {
+    addFinding(policy.architectureReviewSeverity, failures, warnings, "Missing architecture review");
   }
 
   if (riskApprovalRequired && !riskApprovalRecorded) {
@@ -86,6 +141,24 @@ export function collectChecks(root, context, changedFiles = []) {
 
   if (!aiTestScenariosReviewRequired) {
     failures.push("AI generated test scenarios require human_review_required: true");
+  }
+  if (!aiTestIntentReviewRequired) {
+    failures.push("AI generated test intent requires human_review_required: true");
+  }
+  if (aiTestIntentPresent && aiTestIntentReviewRequired && !aiTestIntentReviewed) {
+    failures.push("AI generated test intent requires human review");
+  }
+  if (harnessResult.exists && harnessResult.status === "failed") {
+    failures.push("Harness result failed");
+  }
+  if (harnessResult.exists && harnessResult.status === "invalid") {
+    failures.push("Harness result is invalid");
+  }
+  if (evidence.failed) {
+    failures.push("Validation evidence failed");
+  }
+  if (harnessResult.exists && harnessResult.status === "not_run") {
+    warnings.push("Harness result was not run");
   }
 
   if (changedFiles.length) {
@@ -216,6 +289,10 @@ function hasCompletedUiBrief(root, changeDir) {
   return ["Goal", "Users", "Layout", "Key States", "Style Source", "Acceptance"].every((heading) => hasFilledSection(text, heading));
 }
 
+function hasAiOnlyValidationClaim(text) {
+  return /(?:AI|LLM|模型)\s*(?:says|said|reports|reported|认为|表示)?\s*(?:pass|passed|通过)|(?:pass|passed|通过)\s*(?:by|from)?\s*(?:AI|LLM|模型)/i.test(String(text || ""));
+}
+
 function isAllowedForRole(file, role, config) {
   const normalized = normalizePath(file);
   const allowed = roleAllowedPaths(role, config);
@@ -238,6 +315,21 @@ function readJsonResult(file) {
     return String(parsed.result || "");
   } catch {
     return "";
+  }
+}
+
+function readHarnessResult(root, context) {
+  const jsonPath = path.join(root, ".aiflow", "artifacts", "tests", "harness-result.json");
+  if (!exists(jsonPath)) return { exists: false, status: "" };
+  try {
+    const parsed = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
+    const sameChange = !parsed.change || parsed.change === context.state.active_change;
+    return {
+      exists: sameChange,
+      status: sameChange ? String(parsed.status || "") : ""
+    };
+  } catch {
+    return { exists: true, status: "invalid" };
   }
 }
 
@@ -276,7 +368,10 @@ function resolvePolicy(config) {
     requireUiEvidence: strict || config.checks.require_ui_evidence === true || config.checks.require_ui_evidence === "true" || config.ui === "required",
     sourceSeverity: light ? "warn" : "fail",
     validationSeverity: light ? "warn" : "fail",
+    validationEvidenceSeverity: strict ? "fail" : "warn",
     riskSeverity: light ? "warn" : "fail",
+    requirementSnapshotSeverity: strict ? "fail" : "warn",
+    architectureReviewSeverity: light ? "warn" : "fail",
     uiSeverity: light ? "warn" : "fail",
     roleBoundarySeverity: strict ? "fail" : "warn"
   };
@@ -295,7 +390,11 @@ function renderMetadataLines(metadata = {}) {
 }
 
 function nextForFailure(context, failure) {
+  if (failure.includes("requirement snapshot")) return `Fill openspec/changes/${context.state.active_change}/requirement.md or rerun aiflow intake with concrete intent, value, acceptance, non-goals, risk, and impact`;
+  if (failure.includes("architecture review")) return `Record architecture review in openspec/changes/${context.state.active_change}/architect.md or run aiflow change approve ${context.state.active_change} --design`;
   if (failure.includes("requirement source")) return `Add requirement source to openspec/changes/${context.state.active_change}/${context.state.current_role}.md`;
+  if (failure.includes("AI validation claim")) return "Run a harness command or link human-reviewed evidence; AI says passed is not final evidence";
+  if (failure.includes("validation evidence")) return "Run aiflow test run --command <command> or link passed evidence with aiflow evidence add";
   if (failure.includes("validation")) return `Record validation result in openspec/changes/${context.state.active_change}/${context.state.current_role}.md`;
   if (failure.includes("risk")) return `Record risk notes in openspec/changes/${context.state.active_change}/${context.state.current_role}.md`;
   if (failure.includes("Risk Approval")) return `Run aiflow change approve ${context.state.active_change} --risk ${context.state.risk}`;
@@ -304,6 +403,11 @@ function nextForFailure(context, failure) {
   if (failure.includes("UI Brief")) return "Fill .aiflow/artifacts/ui/ui-brief.md or provide a concrete UI source";
   if (failure.includes("UI")) return "Run aiflow ui classify and aiflow ui verify";
   if (failure.includes("AI generated test scenarios")) return `Add human_review_required: true to openspec/changes/${context.state.active_change}/test-scenarios.yaml before CI enforcement`;
+  if (failure.includes("test intent requires human_review_required")) return `Add human_review_required: true to openspec/changes/${context.state.active_change}/test-intent.yaml before CI enforcement`;
+  if (failure.includes("test intent requires human review")) return "Review the test intent, then run aiflow test review";
+  if (failure.includes("Harness result failed")) return "Inspect .aiflow/artifacts/tests/harness-result.yaml and rerun aiflow test run";
+  if (failure.includes("Harness result is invalid")) return "Regenerate .aiflow/artifacts/tests/harness-result.json with aiflow test run";
+  if (failure.includes("Validation evidence failed")) return `Inspect openspec/changes/${context.state.active_change}/evidence.yaml and rerun the failing harness`;
   if (failure.includes("git diff")) return "Check the --base or --since ref, then rerun aiflow check";
   return failure;
 }
@@ -314,6 +418,37 @@ function hasFilledSection(text, heading) {
   if (!match) return false;
   const content = match[1].replace(/<!--[\s\S]*?-->/g, "").trim();
   return Boolean(content) && !/^(TODO|TBD|待补充|none)$/i.test(content);
+}
+
+function routeRequiresRequirementSnapshot(context) {
+  return routeRequiresGate(context, "requirement_snapshot");
+}
+
+function routeRequiresGate(context, gateName) {
+  const routeFile = path.join(context.changeDir, "route.yaml");
+  return exists(routeFile) && context.route?.gates?.[gateName] === "required";
+}
+
+function hasRequirementSnapshot(text) {
+  return ["Change Intent", "User Value", "Acceptance Criteria", "Non-goals", "Risk", "Impact Scope"]
+    .every((heading) => hasConcreteSection(text, heading));
+}
+
+function hasConcreteSection(text, heading) {
+  const pattern = new RegExp(`^##\\s+${escapeRegex(heading)}\\s*$([\\s\\S]*?)(?=^##\\s+|(?![\\s\\S]))`, "im");
+  const match = String(text || "").match(pattern);
+  if (!match) return false;
+  const content = match[1]
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/^[-*]\s*/gm, "")
+    .trim();
+  return Boolean(content) && !/TODO|TBD|待补充|none/i.test(content);
+}
+
+function hasArchitectureReview({ architectText, designText, approvals }) {
+  if (/Architecture Review|Design Approval/i.test(approvals)) return true;
+  if (hasConcreteSection(architectText, "Work Notes") && hasConcreteSection(architectText, "Validation")) return true;
+  return ["Approach", "Compatibility", "Risk"].every((heading) => hasConcreteSection(designText, heading));
 }
 
 function resultForGit(mode, result) {

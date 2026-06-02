@@ -4,6 +4,26 @@ All notable changes to this project will be documented here.
 
 The format is based on Keep a Changelog, and this project intends to use semantic versioning after the first public release.
 
+## 0.1.3 - 2026-06-02
+
+### Added
+
+- Added change-centered route policy preview and `aiflow next` console guidance for required roles, missing gates, and recommended next commands.
+- Added AI test intent review flow, command harness execution, Playwright scenario harness result files, and evidence records for harness outcomes.
+- Added `aiflow evidence add` and `aiflow evidence list` for manually linked validation evidence.
+
+### Changed
+
+- Strengthened gate checks around requirement snapshots, architecture review, validation evidence, UI evidence, risk/scope/design approval, delivery approval, and release records.
+- `aiflow next` now reports gate required/satisfied status across the delivery workflow instead of only a small subset of gates.
+- High-risk routes now explicitly include design approval as a required route gate.
+
+### Fixed
+
+- Failed or invalid harness results now block checks.
+- Strict/L3 validation gates now require a passed harness result or passed linked validation evidence.
+- Non-validation evidence and validation records without linked artifacts no longer satisfy required validation evidence gates.
+
 ## 0.1.1 - 2026-05-28
 
 ### Added

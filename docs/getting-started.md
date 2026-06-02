@@ -3,7 +3,9 @@
 ```bash
 npx aiflow-kit init
 npx aiflow doctor
-npx aiflow change start fix-login --role dev --risk s1
+npx aiflow intake fix-login --type bugfix --from dev --risk s1 --intent "Fix the login failure"
+npx aiflow next
+npx aiflow context --role dev
 npx aiflow check
 ```
 
@@ -29,5 +31,6 @@ For UI work:
 
 ```bash
 npx aiflow change start dashboard --role dev --risk s1 --ui
+npx aiflow next
 npx aiflow ui verify --url http://localhost:3000
 ```

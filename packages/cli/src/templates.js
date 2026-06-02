@@ -137,6 +137,37 @@ TODO
 `;
 }
 
+export function templateRequirementSnapshot(slug, requirementLevel) {
+  return `# Requirement Snapshot: ${slug}
+
+requirement_level: ${requirementLevel}
+
+## Change Intent
+
+TODO
+
+## User Value
+
+TODO
+
+## Acceptance Criteria
+
+- TODO
+
+## Non-goals
+
+- TODO
+
+## Risk
+
+TODO
+
+## Impact Scope
+
+TODO
+`;
+}
+
 export function templateRole(role, slug) {
   return `# ${role}: ${slug}
 
