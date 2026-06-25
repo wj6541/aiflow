@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { runCli, EXIT } from "../src/core.js";
 
 test("init creates minimal project files and is idempotent", async () => {
@@ -151,6 +152,57 @@ test("route policies match change-centered workflow defaults", async () => {
     assert.equal(result.code, EXIT.PASS);
     assert.deepEqual(requiredRolesFromRoute(result.stdout), expected.split(","));
   }
+});
+
+test("intake routes ambiguous natural-language refactor through PM", async () => {
+  const root = tempDir();
+  await run(["init", "--mode", "legacy"], root);
+
+  const result = await run(["intake", "login-module", "--risk", "s1", "--intent", "我想重构登录模块"], root);
+  assert.equal(result.code, EXIT.PASS);
+  assert.match(result.stdout, /Change type: feature_request/);
+  assert.match(result.stdout, /classification: pm_clarification_for_ambiguous_refactor/);
+  assert.match(result.stdout, /Entry role: pm/);
+  assert.match(result.stdout, /Route: pm -> architect -> dev -> qa -> release/);
+
+  const change = fs.readFileSync(path.join(root, "openspec", "changes", "login-module", "change.yaml"), "utf8");
+  const route = fs.readFileSync(path.join(root, "openspec", "changes", "login-module", "route.yaml"), "utf8");
+  const state = fs.readFileSync(path.join(root, ".aiflow", "state", "current.yaml"), "utf8");
+  assert.match(change, /type: feature_request/);
+  assert.match(change, /entry_role: pm/);
+  assert.match(route, /required:\n  - pm\n  - architect\n  - dev\n  - qa\n  - release/);
+  assert.match(state, /current_role: pm/);
+});
+
+test("intake infers refactor only when behavior is explicitly preserved", async () => {
+  const root = tempDir();
+  await run(["init", "--mode", "legacy"], root);
+
+  const result = await run(["intake", "login-module", "--risk", "s1", "--intent", "我想重构登录模块，不改变行为，只改代码结构"], root);
+  assert.equal(result.code, EXIT.PASS);
+  assert.match(result.stdout, /Change type: refactor/);
+  assert.match(result.stdout, /classification: pure_engineering_refactor/);
+  assert.match(result.stdout, /Entry role: dev/);
+  assert.match(result.stdout, /Route: architect -> dev -> qa/);
+
+  const change = fs.readFileSync(path.join(root, "openspec", "changes", "login-module", "change.yaml"), "utf8");
+  const route = fs.readFileSync(path.join(root, "openspec", "changes", "login-module", "route.yaml"), "utf8");
+  const state = fs.readFileSync(path.join(root, ".aiflow", "state", "current.yaml"), "utf8");
+  assert.match(change, /type: refactor/);
+  assert.match(change, /entry_role: dev/);
+  assert.match(route, /architecture_review: required/);
+  assert.match(state, /current_role: dev/);
+});
+
+test("intake routes generic natural-language changes through PM", async () => {
+  const root = tempDir();
+  await run(["init", "--mode", "legacy"], root);
+
+  const result = await run(["intake", "login-module", "--risk", "s1", "--intent", "我想更改登录模块"], root);
+  assert.equal(result.code, EXIT.PASS);
+  assert.match(result.stdout, /Change type: feature_request/);
+  assert.match(result.stdout, /classification: pm_clarification_for_product_intent/);
+  assert.match(result.stdout, /Entry role: pm/);
 });
 
 test("intake creates a requirement snapshot and recommended route", async () => {
@@ -302,6 +354,26 @@ test("strict check blocks required route gates when requirement snapshot is miss
   assert.match(result.stdout, /aiflow intake/);
 });
 
+test("strict check still applies fallback route gates when route file is missing", async () => {
+  const root = tempDir();
+  await run(["init", "--mode", "new", "--strictness", "strict"], root);
+  await run(["change", "start", "Legacy Guard", "--type", "bugfix", "--from", "dev", "--risk", "s1"], root);
+  fs.rmSync(path.join(root, "openspec", "changes", "legacy-guard", "route.yaml"));
+  fs.writeFileSync(path.join(root, "openspec", "changes", "legacy-guard", "dev.md"), [
+    "# Dev: legacy-guard",
+    "",
+    "- Requirement Source: issue report",
+    "- Risk: low",
+    "- Validation: npm test"
+  ].join("\n"));
+  writeNonUiEvidence(root, "legacy-guard");
+
+  const result = await run(["check", "--ci"], root);
+  assert.equal(result.code, EXIT.CHECK_FAILED);
+  assert.match(result.stdout, /requirement_snapshot_required: true/);
+  assert.match(result.stdout, /Missing requirement snapshot/);
+});
+
 test("next surfaces warning-level route gates without failing standard projects", async () => {
   const root = tempDir();
   await run(["init", "--mode", "legacy"], root);
@@ -445,6 +517,164 @@ test("next, context, and prompt provide role routing guidance", async () => {
   assert.match(prompt.stdout, /AI output is not final acceptance evidence/);
   assert.match(prompt.stdout, /prompt_file: \.aiflow\/artifacts\/prompts\/checkout-copy-qa-prompt\.md/);
   assert.ok(fs.existsSync(path.join(root, ".aiflow", "artifacts", "prompts", "checkout-copy-qa-prompt.md")));
+});
+
+test("next handoff preview requires confirmation without changing role", async () => {
+  const root = tempDir();
+  await run(["init", "--mode", "legacy"], root);
+  await run(["change", "start", "fix-login", "--type", "bugfix", "--from", "dev", "--risk", "s1"], root);
+  fs.writeFileSync(path.join(root, "openspec", "changes", "fix-login", "dev.md"), [
+    "# Dev: fix-login",
+    "",
+    "- Requirement Source: login ticket",
+    "- Risk: low",
+    "- Validation: npm test"
+  ].join("\n"));
+
+  const result = await run(["next", "--handoff"], root);
+  assert.equal(result.code, EXIT.PASS);
+  assert.match(result.stdout, /next_role: qa/);
+  assert.match(result.stdout, /handoff_available: true/);
+  assert.match(result.stdout, /confirmation_required: true/);
+  assert.match(result.stdout, /confirm_command: aiflow next --handoff --confirm/);
+
+  const state = fs.readFileSync(path.join(root, ".aiflow", "state", "current.yaml"), "utf8");
+  assert.match(state, /current_role: dev/);
+  assert.ok(!fs.existsSync(path.join(root, "openspec", "changes", "fix-login", "handoff.md")));
+});
+
+test("next handoff confirm advances the computed next role", async () => {
+  const root = tempDir();
+  await run(["init", "--mode", "legacy"], root);
+  await run(["change", "start", "fix-login", "--type", "bugfix", "--from", "dev", "--risk", "s1"], root);
+  fs.writeFileSync(path.join(root, "openspec", "changes", "fix-login", "dev.md"), [
+    "# Dev: fix-login",
+    "",
+    "- Requirement Source: login ticket",
+    "- Risk: low",
+    "- Validation: npm test"
+  ].join("\n"));
+
+  const result = await run(["next", "--handoff", "--confirm"], root);
+  assert.equal(result.code, EXIT.PASS);
+  assert.match(result.stdout, /Handoff recorded: dev -> qa/);
+
+  const state = fs.readFileSync(path.join(root, ".aiflow", "state", "current.yaml"), "utf8");
+  const change = fs.readFileSync(path.join(root, "openspec", "changes", "fix-login", "change.yaml"), "utf8");
+  const handoff = fs.readFileSync(path.join(root, "openspec", "changes", "fix-login", "handoff.md"), "utf8");
+  assert.match(state, /current_role: qa/);
+  assert.match(change, /current_role: qa/);
+  assert.match(handoff, /command: aiflow next --handoff --confirm/);
+  assert.match(handoff, /note: Confirmed next handoff from dev to qa/);
+});
+
+test("next handoff confirm is blocked by current role check failures", async () => {
+  const root = tempDir();
+  await run(["init", "--mode", "legacy"], root);
+  await run(["change", "start", "fix-login", "--type", "bugfix", "--from", "dev", "--risk", "s1"], root);
+
+  const result = await run(["next", "--handoff", "--confirm"], root);
+  assert.equal(result.code, EXIT.CHECK_FAILED);
+  assert.match(result.stderr, /Handoff blocked/);
+
+  const state = fs.readFileSync(path.join(root, ".aiflow", "state", "current.yaml"), "utf8");
+  assert.match(state, /current_role: dev/);
+  assert.ok(!fs.existsSync(path.join(root, "openspec", "changes", "fix-login", "handoff.md")));
+});
+
+test("handoff to role updates current role and records transition evidence", async () => {
+  const root = tempDir();
+  await run(["init", "--mode", "legacy"], root);
+  await run(["change", "start", "fix-login", "--type", "bugfix", "--from", "dev", "--risk", "s1"], root);
+
+  const result = await run(["handoff", "--to", "qa", "--note", "Ready for QA review"], root);
+  assert.equal(result.code, EXIT.PASS);
+  assert.match(result.stdout, /Handoff recorded: dev -> qa/);
+  assert.match(result.stdout, /Current role: qa/);
+  assert.match(result.stdout, /handoff_file: openspec\/changes\/fix-login\/handoff\.md/);
+
+  const state = fs.readFileSync(path.join(root, ".aiflow", "state", "current.yaml"), "utf8");
+  const change = fs.readFileSync(path.join(root, "openspec", "changes", "fix-login", "change.yaml"), "utf8");
+  const handoff = fs.readFileSync(path.join(root, "openspec", "changes", "fix-login", "handoff.md"), "utf8");
+  assert.match(state, /current_role: qa/);
+  assert.match(state, /last_handoff_at:/);
+  assert.match(change, /current_role: qa/);
+  assert.match(handoff, /## Transition History/);
+  assert.match(handoff, /from_role: dev/);
+  assert.match(handoff, /to_role: qa/);
+  assert.match(handoff, /note: Ready for QA review/);
+  assert.match(handoff, /command: aiflow handoff --to qa --note Ready for QA review/);
+});
+
+test("handoff rejects invalid target roles without changing state", async () => {
+  const root = tempDir();
+  await run(["init", "--mode", "legacy"], root);
+  await run(["change", "start", "fix-login", "--type", "bugfix", "--from", "dev", "--risk", "s1"], root);
+
+  const result = await run(["handoff", "--to", "support"], root);
+  assert.equal(result.code, EXIT.CONFIG_ERROR);
+  assert.match(result.stderr, /Invalid role: support/);
+
+  const state = fs.readFileSync(path.join(root, ".aiflow", "state", "current.yaml"), "utf8");
+  const change = fs.readFileSync(path.join(root, "openspec", "changes", "fix-login", "change.yaml"), "utf8");
+  assert.match(state, /current_role: dev/);
+  assert.match(change, /current_role: dev/);
+});
+
+test("handoff coordinates next, context, and prompt defaults with the new current role", async () => {
+  const root = tempDir();
+  await run(["init", "--mode", "legacy"], root);
+  await run(["change", "start", "fix-login", "--type", "bugfix", "--from", "dev", "--risk", "s1"], root);
+  await run(["handoff", "--to", "qa"], root);
+
+  const next = await run(["next"], root);
+  assert.equal(next.code, EXIT.CHECK_FAILED);
+  assert.match(next.stdout, /Current role: qa/);
+  assert.match(next.stdout, /next_role: none/);
+  assert.match(next.stdout, /openspec\/changes\/fix-login\/qa\.md/);
+
+  const context = await run(["context"], root);
+  assert.equal(context.code, EXIT.PASS);
+  assert.match(context.stdout, /requested_role: qa/);
+  assert.match(context.stdout, /current_role: qa/);
+  assert.match(context.stdout, /context_file: \.aiflow\/artifacts\/context\/fix-login-qa-context\.md/);
+
+  const prompt = await run(["prompt"], root);
+  assert.equal(prompt.code, EXIT.PASS);
+  assert.match(prompt.stdout, /Prompt for qa/);
+  assert.match(prompt.stdout, /current_role: qa/);
+});
+
+test("handoff role transition remains compatible with change, check, and test run flows", async () => {
+  const root = tempDir();
+  await run(["init", "--mode", "legacy"], root);
+  await run(["change", "start", "fix-login", "--type", "bugfix", "--from", "dev", "--risk", "s1"], root);
+  writeRequirementSnapshot(root, "fix-login", {
+    intent: "Fix the login regression",
+    value: "Users can sign in reliably",
+    acceptance: "login test passes",
+    impact: "login flow"
+  });
+  await run(["handoff", "--to", "qa", "--note", "Implementation is ready for QA"], root);
+  fs.writeFileSync(path.join(root, "openspec", "changes", "fix-login", "qa.md"), [
+    "# QA: fix-login",
+    "",
+    "- Requirement Source: requirement snapshot",
+    "- Risk: low",
+    "- Validation: command harness"
+  ].join("\n"));
+
+  const harness = await run(["test", "run", "--command", `${process.execPath} --version`], root);
+  assert.equal(harness.code, EXIT.PASS);
+
+  const check = await run(["check", "--ci"], root);
+  assert.equal(check.code, EXIT.PASS);
+  assert.match(check.stdout, /Current role: qa/);
+  assert.match(check.stdout, /harness_result_passed: true/);
+
+  const status = await run(["change", "status"], root);
+  assert.equal(status.code, EXIT.PASS);
+  assert.match(status.stdout, /current_role: qa/);
 });
 
 test("check reports missing requirement source and validation", async () => {
@@ -820,6 +1050,7 @@ test("check only accepts linked passed validation evidence for validation gates"
 
   await run(["evidence", "add", "--type", "delivery", "--source", "manual", "--status", "passed", "--artifact", "README.md", "--note", "Delivery note is not validation"], root);
   await run(["evidence", "add", "--type", "validation", "--source", "manual", "--status", "passed", "--note", "No artifact is linked"], root);
+  await run(["evidence", "add", "--type", "validation", "--source", "manual", "--status", "passed", "--artifact", ".aiflow/artifacts/tests/missing.txt", "--note", "Missing artifact should not pass"], root);
 
   const before = await run(["check", "--ci"], root);
   assert.equal(before.code, EXIT.CHECK_FAILED);
@@ -1215,6 +1446,32 @@ test("next recommends human review for AI generated test intent", async () => {
   assert.match(result.stdout, /aiflow test review/);
 });
 
+test("route-required test intent review fails when no test intent exists", async () => {
+  const root = tempDir();
+  await run(["init", "--mode", "legacy"], root);
+  await run(["change", "start", "qa-plan", "--type", "test", "--from", "qa", "--risk", "s1"], root);
+  writeRequirementSnapshot(root, "qa-plan", {
+    intent: "Add reviewed QA intent",
+    value: "QA scope is explicit",
+    acceptance: "test intent is reviewed",
+    impact: "QA workflow"
+  });
+  fs.writeFileSync(path.join(root, "openspec", "changes", "qa-plan", "qa.md"), [
+    "# QA: qa-plan",
+    "",
+    "- Requirement Source: QA ticket",
+    "- Risk: low",
+    "- Validation: reviewed test intent"
+  ].join("\n"));
+  writeNonUiEvidence(root, "qa-plan");
+
+  const result = await run(["check", "--ci"], root);
+  assert.equal(result.code, EXIT.CHECK_FAILED);
+  assert.match(result.stdout, /test_intent_review_required: true/);
+  assert.match(result.stdout, /test_intent_review_satisfied: false/);
+  assert.match(result.stdout, /Route requires reviewed test intent/);
+});
+
 test("test run blocks AI scenarios until human approval is recorded", async () => {
   const root = tempDir();
   await run(["init", "--mode", "legacy"], root);
@@ -1248,13 +1505,32 @@ test("test run executes reviewed scenarios with Playwright", async () => {
   const harness = JSON.parse(fs.readFileSync(path.join(root, ".aiflow", "artifacts", "tests", "harness-result.json"), "utf8"));
   const harnessYaml = fs.readFileSync(path.join(root, ".aiflow", "artifacts", "tests", "harness-result.yaml"), "utf8");
   assert.equal(report.result, "pass");
+  assert.equal(report.scenario_count, 1);
   assert.equal(report.scenarios[0].name, "checkout-success");
+  assert.equal(report.scenarios[0].steps, 3);
+  assert.equal(report.scenarios[0].assertions, 1);
+  assert.match(report.scenarios[0].screenshot, /checkout-success\.png$/);
   assert.equal(harness.source, "harness");
   assert.equal(harness.change, "checkout-run");
   assert.equal(harness.status, "passed");
   assert.equal(harness.exit_code, 0);
   assert.match(harnessYaml, /status: passed/);
   assert.match(harnessYaml, /artifacts:/);
+  assert.ok(fs.existsSync(path.join(root, ".aiflow", "artifacts", "tests", "screenshots", "checkout-success.png")));
+});
+
+test("test run can use @playwright/test when playwright is not top-level importable", async () => {
+  const root = tempDir();
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ devDependencies: { "@playwright/test": "1.0.0" } }, null, 2));
+  writeFakePlaywright(root, "@playwright/test");
+  await run(["init", "--mode", "legacy"], root);
+  await run(["change", "start", "checkout-run", "--role", "qa", "--risk", "s1"], root);
+  fs.writeFileSync(path.join(root, "openspec", "changes", "checkout-run", "test-scenarios.yaml"), aiScenarioYaml());
+  await run(["test", "approve"], root);
+
+  const result = await run(["test", "run", "--url", "http://127.0.0.1:4173"], root);
+  assert.equal(result.code, EXIT.PASS);
+  assert.match(result.stdout, /Test scenarios executed/);
   assert.ok(fs.existsSync(path.join(root, ".aiflow", "artifacts", "tests", "screenshots", "checkout-success.png")));
 });
 
@@ -1338,6 +1614,24 @@ test("test run blocks external goto and unsupported scenario steps", async () =>
   const unsupported = await run(["test", "run", "--url", "http://127.0.0.1:4173"], root);
   assert.equal(unsupported.code, EXIT.UNSAFE_OPERATION);
   assert.match(unsupported.stderr, /unsupported scenario step: evaluate/);
+});
+
+test("test run blocks scenarios without executable steps or assertions", async () => {
+  const root = tempDir();
+  await run(["init", "--mode", "legacy"], root);
+  await run(["change", "start", "checkout-run", "--role", "qa", "--risk", "s1"], root);
+  fs.writeFileSync(path.join(root, "openspec", "changes", "checkout-run", "test-scenarios.yaml"), aiScenarioYaml());
+  await run(["test", "approve"], root);
+
+  fs.writeFileSync(path.join(root, "openspec", "changes", "checkout-run", "test-scenarios.yaml"), aiScenarioYaml({ steps: [] }));
+  const noSteps = await run(["test", "run", "--url", "http://127.0.0.1:4173"], root);
+  assert.equal(noSteps.code, EXIT.UNSAFE_OPERATION);
+  assert.match(noSteps.stderr, /must include at least one executable step/);
+
+  fs.writeFileSync(path.join(root, "openspec", "changes", "checkout-run", "test-scenarios.yaml"), aiScenarioYaml({ steps: ["      - goto: /cart"] }));
+  const noAssertions = await run(["test", "run", "--url", "http://127.0.0.1:4173"], root);
+  assert.equal(noAssertions.code, EXIT.UNSAFE_OPERATION);
+  assert.match(noAssertions.stderr, /must include at least one expect_\* assertion/);
 });
 
 test("test run sanitizes scenario names before writing screenshots", async () => {
@@ -1494,6 +1788,112 @@ test("doctor reports compatible OpenSpec structure", async () => {
   assert.match(result.stdout, /openspec_compatibility: compatible/);
 });
 
+test("platform verify records passed GitHub readonly evidence from snapshot", async () => {
+  const root = tempDir();
+  await run(["init", "--mode", "legacy"], root);
+  await run(["change", "start", "platform-check", "--role", "release", "--risk", "s1"], root);
+  fs.writeFileSync(path.join(root, "github-pr.json"), JSON.stringify({
+    repository: "acme/app",
+    number: 123,
+    url: "https://github.com/acme/app/pull/123",
+    state: "open",
+    draft: false,
+    base_branch: "main",
+    head_sha: "abc123",
+    status_state: "success",
+    mergeable: true,
+    mergeable_state: "clean",
+    check_runs: [
+      { name: "CI", status: "completed", conclusion: "success" }
+    ],
+    reviews: [
+      { user: "qa", state: "APPROVED", submitted_at: "2026-06-10T01:00:00Z" }
+    ]
+  }, null, 2));
+
+  const result = await run(["platform", "verify", "--from-file", "github-pr.json", "--base", "main", "--required-reviews", "1"], root);
+  assert.equal(result.code, EXIT.PASS);
+  assert.match(result.stdout, /Platform verify: passed/);
+  assert.match(result.stdout, /checks_passed: true/);
+  assert.ok(fs.existsSync(path.join(root, ".aiflow", "artifacts", "platform", "github-pr-123.yaml")));
+
+  const evidence = fs.readFileSync(path.join(root, "openspec", "changes", "platform-check", "platform-evidence.yaml"), "utf8");
+  assert.match(evidence, /status: passed/);
+  assert.match(evidence, /required_reviews_satisfied: true/);
+});
+
+test("platform verify fails on failing checks or review blockers", async () => {
+  const root = tempDir();
+  await run(["init", "--mode", "legacy"], root);
+  fs.writeFileSync(path.join(root, "github-pr.json"), JSON.stringify({
+    repository: "acme/app",
+    number: 124,
+    url: "https://github.com/acme/app/pull/124",
+    state: "open",
+    draft: false,
+    base_branch: "main",
+    head_sha: "abc123",
+    status_state: "failure",
+    mergeable: false,
+    check_runs: [
+      { name: "CI", status: "completed", conclusion: "failure" }
+    ],
+    reviews: [
+      { user: "qa", state: "CHANGES_REQUESTED", submitted_at: "2026-06-10T01:00:00Z" }
+    ]
+  }, null, 2));
+
+  const result = await run(["platform", "verify", "--from-file", "github-pr.json", "--base", "main", "--required-reviews", "1"], root);
+  assert.equal(result.code, EXIT.CHECK_FAILED);
+  assert.match(result.stdout, /Platform verify: failed/);
+  assert.match(result.stdout, /checks_not_passed/);
+  assert.match(result.stdout, /required_reviews_not_satisfied/);
+  assert.match(result.stdout, /merge_conflict_or_not_mergeable/);
+});
+
+test("platform verify fails closed when head sha or checks are missing", async () => {
+  const root = tempDir();
+  await run(["init", "--mode", "legacy"], root);
+  fs.writeFileSync(path.join(root, "github-pr.json"), JSON.stringify({
+    repository: "acme/app",
+    number: 125,
+    url: "https://github.com/acme/app/pull/125",
+    state: "open",
+    draft: false,
+    base_branch: "main",
+    status_state: "unknown",
+    mergeable: true,
+    check_runs: [],
+    reviews: []
+  }, null, 2));
+
+  const result = await run(["platform", "verify", "--from-file", "github-pr.json", "--base", "main"], root);
+  assert.equal(result.code, EXIT.CHECK_FAILED);
+  assert.match(result.stdout, /head_sha_missing/);
+  assert.match(result.stdout, /checks_not_reported/);
+  assert.match(result.stdout, /checks_not_passed/);
+});
+
+test("registry version check fails when npm reports the candidate version", () => {
+  const root = tempDir();
+  const pkg = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  const fakeBin = writeFakeNpm(root, { stdout: `${JSON.stringify(pkg.version)}\n` });
+  const script = fileURLToPath(new URL("../../../scripts/check-registry-version.mjs", import.meta.url));
+  const repoRoot = fileURLToPath(new URL("../../..", import.meta.url));
+
+  const result = spawnSync(process.execPath, [script], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ""}`
+    }
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /already exists on npm/);
+});
+
 test("check without config returns config error", async () => {
   const root = tempDir();
   const result = await run(["check", "--ci"], root);
@@ -1511,7 +1911,7 @@ test("help lists the full public command surface", async () => {
   assert.match(result.stdout, /aiflow change start <topic> \[--type bugfix\]/);
   assert.match(result.stdout, /aiflow intake <topic> \[--type bugfix\]/);
   assert.match(result.stdout, /aiflow route \[--type bugfix\]/);
-  assert.match(result.stdout, /aiflow next/);
+  assert.match(result.stdout, /aiflow next \[--handoff\] \[--confirm\] \[--note text\]/);
   assert.match(result.stdout, /aiflow context \[--role dev\]/);
   assert.match(result.stdout, /aiflow prompt \[--role dev\]/);
   assert.match(result.stdout, /aiflow evidence add/);
@@ -1523,7 +1923,9 @@ test("help lists the full public command surface", async () => {
   assert.match(result.stdout, /aiflow test approve \[--reason text\]/);
   assert.match(result.stdout, /aiflow test run --command "npm test"/);
   assert.match(result.stdout, /aiflow test run --url http:\/\/localhost:3000/);
+  assert.match(result.stdout, /aiflow handoff \[--to qa\] \[--note text\]/);
   assert.match(result.stdout, /aiflow delivery record <change> --action mr\|merge\|release --ref <value>/);
+  assert.match(result.stdout, /aiflow platform verify --provider github --pr <url>/);
   assert.match(result.stdout, /aiflow config migrate \[--ci\] \[--allow-write\]/);
 
   const helpCommand = await run(["help"], root);
@@ -1768,7 +2170,14 @@ Revert the release change.
 `);
 }
 
-function aiScenarioYaml({ name = "checkout-success", goto = "/cart", extraStep = "" } = {}) {
+function aiScenarioYaml({ name = "checkout-success", goto = "/cart", extraStep = "", steps = null } = {}) {
+  const stepLines = steps ?? [
+    `      - goto: ${goto}`,
+    "      - click:",
+    "          role: button",
+    "          name: Checkout",
+    "      - expect_text: Order confirmed"
+  ];
   return `scenarios:
   - name: ${name}
     source: ai_generated
@@ -1780,11 +2189,7 @@ function aiScenarioYaml({ name = "checkout-success", goto = "/cart", extraStep =
     test_data:
       route: ${goto}
     steps:
-      - goto: ${goto}
-      - click:
-          role: button
-          name: Checkout
-      - expect_text: Order confirmed
+${stepLines.join("\n")}
 ${extraStep ? `${extraStep}\n` : ""}    evidence:
       screenshots: true
       console_errors: true
@@ -1792,10 +2197,10 @@ ${extraStep ? `${extraStep}\n` : ""}    evidence:
 `;
 }
 
-function writeFakePlaywright(root) {
-  const dir = path.join(root, "node_modules", "playwright");
+function writeFakePlaywright(root, moduleName = "playwright") {
+  const dir = path.join(root, "node_modules", ...moduleName.split("/"));
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "playwright", version: "1.0.0", type: "module", main: "index.js" }, null, 2));
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: moduleName, version: "1.0.0", type: "module", main: "index.js" }, null, 2));
   fs.writeFileSync(path.join(dir, "index.js"), `
 import fs from "node:fs";
 
@@ -1848,7 +2253,20 @@ export const chromium = {
     };
   }
 };
+  `);
+}
+
+function writeFakeNpm(root, { stdout = "", stderr = "", status = 0 } = {}) {
+  const bin = path.join(root, "bin");
+  fs.mkdirSync(bin, { recursive: true });
+  const npm = path.join(bin, "npm");
+  fs.writeFileSync(npm, `#!/usr/bin/env node
+process.stdout.write(${JSON.stringify(stdout)});
+process.stderr.write(${JSON.stringify(stderr)});
+process.exit(${Number(status) || 0});
 `);
+  fs.chmodSync(npm, 0o755);
+  return bin;
 }
 
 function completedUiBrief() {

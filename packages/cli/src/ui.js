@@ -170,9 +170,9 @@ function renderDeviationEntry({ description, reason, acceptedBy, acceptedAt }) {
 }
 
 function playwrightRunnerSource() {
-  return `import { chromium } from "playwright";
-import fs from "node:fs";
+  return `import fs from "node:fs";
 import path from "node:path";
+const { chromium } = await loadPlaywright();
 
 const [url, screenshotsDir, consolePath, responsivePath, viewportsJson] = process.argv.slice(2);
 const viewports = JSON.parse(viewportsJson || "[\\"desktop\\",\\"tablet\\",\\"mobile\\"]");
@@ -208,6 +208,18 @@ try {
 fs.writeFileSync(consolePath, JSON.stringify({ result: errors.length ? "fail" : "pass", errors }, null, 2) + "\\n");
 fs.writeFileSync(responsivePath, JSON.stringify({ result: responsive.every((item) => item.pass) ? "pass" : "fail", viewports: responsive }, null, 2) + "\\n");
 if (errors.length || responsive.some((item) => !item.pass)) process.exitCode = 1;
+
+async function loadPlaywright() {
+  try {
+    return await import("playwright");
+  } catch (primaryError) {
+    try {
+      return await import("@playwright/test");
+    } catch {
+      throw primaryError;
+    }
+  }
+}
 `;
 }
 

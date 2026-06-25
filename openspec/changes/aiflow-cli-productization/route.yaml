@@ -1,0 +1,20 @@
+type: bugfix
+entry_role: dev
+requirement_level: lightweight
+risk: S1
+ui_required: false
+
+required:
+  - dev
+  - qa
+
+optional:
+  - architect
+  - release
+
+gates:
+  requirement_snapshot: required
+  architecture_review: optional
+  validation: required
+  ui_evidence: not_applicable
+  release_record: optional

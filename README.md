@@ -93,7 +93,7 @@ aiflow change list
 aiflow change approve <change> --scope|--design|--risk s2
 aiflow intake <topic> [--type bugfix] [--from dev] [--risk s1] [--intent text] [--value text] [--acceptance text]
 aiflow route [--type bugfix] [--from dev] [--risk s1] [--ui]
-aiflow next
+aiflow next [--handoff] [--confirm] [--note text]
 aiflow context [--role dev]
 aiflow prompt [--role dev]
 aiflow evidence add [--type validation] [--source manual] [--status passed] [--artifact file] [--command command] [--note text]
@@ -109,11 +109,12 @@ aiflow test review [--reason text]
 aiflow test approve [--reason text]
 aiflow test run --command "npm test"
 aiflow test run --url http://localhost:3000 [--scenario file] [--reviewed]
-aiflow handoff
+aiflow handoff [--to qa] [--note text]
 aiflow delivery approve
 aiflow delivery prepare
 aiflow delivery record <change> --action mr|merge|release --ref <value>
 aiflow delivery archive <change>
+aiflow platform verify --provider github --pr <url> [--base main] [--required-reviews 1]
 aiflow followup add <title> [--file path] [--reason text]
 aiflow followup list
 aiflow config migrate [--ci] [--allow-write]
@@ -129,6 +130,7 @@ aiflow config migrate [--ci] [--allow-write]
 - `docs/workflow-model.md`：角色、状态、检查、风险等级和显式交付
 - `docs/ui-validation.md`：UI 来源、UI Brief、截图、响应式检查和偏差记录
 - `docs/ui-e2e.md`：静态 UI 示例的本地浏览器证据流程
+- `docs/platform-verify.md`：GitHub PR 只读平台校验和证据记录
 - `docs/ci-mode.md`：非交互检查和 CI exit codes（退出码）
 - `docs/config.md`：配置、状态结构和迁移行为
 - `docs/release.md`：发布行为和 npm 包说明
@@ -197,6 +199,8 @@ docs/gitlab-ci.example.yml
 
 `aiflow check` 会写入 `.aiflow/state/checks.yaml` 作为最新 checklist snapshot（检查快照）。它只是运行时状态；真正可评审的来源仍然是 `openspec/changes/<change>/` 和 `approvals.md`。
 
+`aiflow handoff` 会生成当前 change 的交接文档。使用 `aiflow handoff --to qa --note "Ready for QA"` 时，CLI 会显式把 `current_role` 推进到目标角色，并在 `openspec/changes/<change>/handoff.md` 记录 transition evidence；它不会执行 QA、release、merge、publish 或 archive 动作。也可以用 `aiflow next --handoff` 让 CLI 根据 route 提示下一角色，并在人工确认后执行 `aiflow next --handoff --confirm`，这样用户不需要记住目标角色命令。
+
 `aiflow init` 会自动把 `.aiflow/state/*.yaml` 写入 `.gitignore`，避免把本地 runtime state（运行状态）提交到仓库；`.aiflow/config.yaml` 仍然应该提交，因为它是团队共享配置。
 
 `aiflow delivery record` 只记录已经在外部显式完成的 MR、merge 或 release（合并请求、合并、发布）动作。它不会调用 GitHub、GitLab、npm 或生产系统。
@@ -252,6 +256,8 @@ aiflow test run --url http://localhost:3000
 ```
 
 `harness-result.yaml/json` 是 Harness evidence。`aiflow check` 会读取它并报告 `harness_result_exists`、`harness_result_status`、`harness_result_passed`；如果已有 harness evidence 明确失败，`check` 会阻止通过。
+
+场景执行是受控的：每个 scenario 必须包含至少一个可执行步骤和至少一个 `expect_*` 断言；`goto` 只能使用相对路径，任意浏览器 JS 和外部跳转会被拦截。`examples/ui-app/test-scenarios.yaml` 提供了一个本地 checkout 页面从点击、填写到断言成功文案的样例。
 
 发布前运行：
 
@@ -381,6 +387,8 @@ strict / L3        -> required records and role boundary violations are failures
 
 For route gates, a required requirement snapshot is enforced as a warning in light/standard projects and as a failure in strict/L3 projects. Dev can start lightweight changes directly, but strict delivery checks still require concrete intent, value, acceptance criteria, non-goals, risk, and impact scope.
 
+When `aiflow intake` runs without `--type`, ambiguous natural-language requests such as "I want to change/refactor the login module" start as `feature_request` with PM as the entry role. It only infers `refactor` when the intent explicitly says behavior is preserved, such as "without behavior changes" or "only change code structure." Passing `--type` overrides this inference.
+
 Required architecture review is checked from recorded role/design artifacts or explicit approval. It is not automatic Architect execution.
 
 Release route gates are surfaced as `check` metadata and `next` recommendations for explicit human commands. They do not trigger release, merge, publish, or archive.
@@ -464,7 +472,7 @@ aiflow change list
 aiflow change approve <change> --scope|--design|--risk s2
 aiflow intake <topic> [--type bugfix] [--from dev] [--risk s1] [--intent text] [--value text] [--acceptance text]
 aiflow route [--type bugfix] [--from dev] [--risk s1] [--ui]
-aiflow next
+aiflow next [--handoff] [--confirm] [--note text]
 aiflow context [--role dev]
 aiflow prompt [--role dev]
 aiflow evidence add [--type validation] [--source manual] [--status passed] [--artifact file] [--command command] [--note text]
@@ -480,15 +488,33 @@ aiflow test review [--reason text]
 aiflow test approve [--reason text]
 aiflow test run --command "npm test"
 aiflow test run --url http://localhost:3000 [--scenario file] [--reviewed]
-aiflow handoff
+aiflow handoff [--to qa] [--note text]
 aiflow delivery approve
 aiflow delivery prepare
 aiflow delivery record <change> --action mr|merge|release --ref <value>
 aiflow delivery archive <change>
+aiflow platform verify --provider github --pr <url> [--base main] [--required-reviews 1]
 aiflow followup add <title> [--file path] [--reason text]
 aiflow followup list
 aiflow config migrate [--ci] [--allow-write]
 ```
+
+Reviewed browser scenarios can be executed with Playwright:
+
+```bash
+aiflow test review --reason "QA reviewed selectors and assertions"
+aiflow test run --url http://localhost:3000
+```
+
+Scenario execution is constrained: each scenario must include at least one executable step and one `expect_*` assertion; relative `goto` paths are allowed, while external `goto` URLs and arbitrary browser JavaScript are blocked. `examples/ui-app/test-scenarios.yaml` provides a local checkout sample that clicks, fills, asserts, and records harness evidence.
+
+Read-only platform verification can check GitHub PR state, base branch, local HEAD alignment, CI/check runs, review blockers, and mergeability without creating, merging, tagging, publishing, or deploying anything:
+
+```bash
+aiflow platform verify --provider github --pr https://github.com/org/repo/pull/123 --required-reviews 1
+```
+
+It writes platform evidence under `.aiflow/artifacts/platform/` and, when a change is active, `openspec/changes/<change>/platform-evidence.yaml`.
 
 `aiflow init` does not overwrite existing workflow files. When it finds existing `AGENTS.md`, `TOOLS.md`, `openspec/`, `.cursor/rules`, or related AI rule files in an uninitialized project, it writes `.aiflow/artifacts/init-merge-report.md` with preserved files, potential conflicts, and merge suggestions.
 
@@ -500,6 +526,7 @@ aiflow config migrate [--ci] [--allow-write]
 - `docs/workflow-model.md`: roles, statuses, checks, risk levels, and explicit delivery.
 - `docs/ui-validation.md`: UI source, UI Brief, screenshots, responsive checks, and deviations.
 - `docs/ui-e2e.md`: local browser evidence flow for the static UI example.
+- `docs/platform-verify.md`: read-only GitHub PR verification and platform evidence.
 - `docs/ci-mode.md`: non-interactive checks and CI exit codes.
 - `docs/config.md`: config/state schema and migration behavior.
 - `docs/release.md`: release behavior and package publishing notes.
@@ -536,6 +563,8 @@ docs/gitlab-ci.example.yml
 `aiflow check --ci` never prompts for interactive input and reports failures with exit codes.
 
 `aiflow init` adds `.aiflow/state/*.yaml` to `.gitignore` so local runtime state stays out of commits. Keep `.aiflow/config.yaml` committed because it is shared team configuration.
+
+`aiflow handoff` writes the current change handoff document. With `aiflow handoff --to qa --note "Ready for QA"`, the CLI explicitly advances `current_role` to the target role and records transition evidence in `openspec/changes/<change>/handoff.md`; it does not execute QA, release, merge, publish, or archive actions. You can also run `aiflow next --handoff` to let the CLI propose the computed next role, then run `aiflow next --handoff --confirm` after explicit human confirmation so users do not need to remember the target-role command.
 
 Before publishing the package:
 
@@ -621,6 +650,8 @@ strict / L3        -> required records and role boundary violations are failures
 ```
 
 For route gates, a required requirement snapshot is a warning in light/standard projects and a failure in strict/L3 projects. Dev can start lightweight changes directly, but strict delivery checks still require concrete intent, value, acceptance criteria, non-goals, risk, and impact scope.
+
+When `aiflow intake` runs without `--type`, ambiguous natural-language requests such as "I want to change/refactor the login module" start as `feature_request` with PM as the entry role. It only infers `refactor` when the intent explicitly says behavior is preserved, such as "without behavior changes" or "only change code structure." Passing `--type` overrides this inference.
 
 Required architecture review is checked from recorded role/design artifacts or explicit approval. It is not automatic Architect execution.
 

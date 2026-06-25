@@ -22,7 +22,7 @@ export function collectChecks(root, context, changedFiles = []) {
   const testScenariosText = readText(path.join(context.changeDir, "test-scenarios.yaml"));
   const testIntentText = readText(path.join(context.changeDir, "test-intent.yaml"));
   const harnessResult = readHarnessResult(root, context);
-  const evidence = readEvidenceSummary(context.changeDir);
+  const evidence = readEvidenceSummary(context.changeDir, root);
   const uiMeta = readUiMetadata(context.changeDir);
   const riskApprovalRequired = context.state.risk === "s2" || context.state.risk === "s3";
   const sourceRecorded = hasFilledField(roleText, ["Requirement source", "需求来源"]);
@@ -57,6 +57,8 @@ export function collectChecks(root, context, changedFiles = []) {
     || /human_reviewed:\s*true\b/.test(testIntentText)
     || approvals.includes("Test Intent Approval")
     || approvals.includes("Test Scenario Approval");
+  const testIntentRouteReviewRequired = routeRequiresGate(context, "test_intent_review");
+  const testIntentRouteReviewSatisfied = Boolean(testIntentText.trim()) && aiTestIntentReviewed;
   const metadata = {
     scope_required: riskApprovalRequired,
     scope_approved: !riskApprovalRequired || scopeApprovalRecorded,
@@ -83,6 +85,8 @@ export function collectChecks(root, context, changedFiles = []) {
     test_intent_exists: Boolean(testIntentText.trim()),
     test_intent_human_review_required: aiTestIntentReviewRequired,
     test_intent_human_reviewed: aiTestIntentReviewed,
+    test_intent_review_required: testIntentRouteReviewRequired,
+    test_intent_review_satisfied: !testIntentRouteReviewRequired || testIntentRouteReviewSatisfied,
     harness_result_exists: harnessResult.exists,
     harness_result_status: harnessResult.status || "missing",
     harness_result_passed: harnessResult.status === "passed",
@@ -147,6 +151,9 @@ export function collectChecks(root, context, changedFiles = []) {
   }
   if (aiTestIntentPresent && aiTestIntentReviewRequired && !aiTestIntentReviewed) {
     failures.push("AI generated test intent requires human review");
+  }
+  if (testIntentRouteReviewRequired && !testIntentRouteReviewSatisfied) {
+    failures.push("Route requires reviewed test intent");
   }
   if (harnessResult.exists && harnessResult.status === "failed") {
     failures.push("Harness result failed");
@@ -405,6 +412,7 @@ function nextForFailure(context, failure) {
   if (failure.includes("AI generated test scenarios")) return `Add human_review_required: true to openspec/changes/${context.state.active_change}/test-scenarios.yaml before CI enforcement`;
   if (failure.includes("test intent requires human_review_required")) return `Add human_review_required: true to openspec/changes/${context.state.active_change}/test-intent.yaml before CI enforcement`;
   if (failure.includes("test intent requires human review")) return "Review the test intent, then run aiflow test review";
+  if (failure.includes("reviewed test intent")) return "Run aiflow test generate, review the intent, then run aiflow test review";
   if (failure.includes("Harness result failed")) return "Inspect .aiflow/artifacts/tests/harness-result.yaml and rerun aiflow test run";
   if (failure.includes("Harness result is invalid")) return "Regenerate .aiflow/artifacts/tests/harness-result.json with aiflow test run";
   if (failure.includes("Validation evidence failed")) return `Inspect openspec/changes/${context.state.active_change}/evidence.yaml and rerun the failing harness`;
@@ -425,8 +433,7 @@ function routeRequiresRequirementSnapshot(context) {
 }
 
 function routeRequiresGate(context, gateName) {
-  const routeFile = path.join(context.changeDir, "route.yaml");
-  return exists(routeFile) && context.route?.gates?.[gateName] === "required";
+  return context.route?.gates?.[gateName] === "required";
 }
 
 function hasRequirementSnapshot(text) {

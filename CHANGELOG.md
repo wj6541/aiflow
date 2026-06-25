@@ -4,6 +4,32 @@ All notable changes to this project will be documented here.
 
 The format is based on Keep a Changelog, and this project intends to use semantic versioning after the first public release.
 
+## 0.1.5 - 2026-06-25
+
+### Added
+
+- Added npm registry version preflight to prevent release checks from passing when the candidate package version already exists.
+- Added explicit route and requirement records for the active productization change.
+
+### Changed
+
+- Tightened workflow gates for legacy changes without `route.yaml`, validation evidence artifacts, GitHub platform verification, Playwright runner module loading, and test-intent review requirements.
+
+## 0.1.4 - 2026-06-10
+
+### Added
+
+- Added reviewed Playwright scenario quality gates requiring executable steps and `expect_*` assertions before browser execution.
+- Added richer Playwright scenario evidence with base URL, scenario counts, step/assertion counts, timestamps, and screenshot paths.
+- Added a local checkout UI example and reviewed scenario fixture for the click/fill/assert E2E workflow.
+- Added read-only GitHub platform verification for PR state, base branch, HEAD alignment, check runs, review blockers, and mergeability.
+- Added platform evidence artifacts under `.aiflow/artifacts/platform/` and active-change `platform-evidence.yaml` output.
+
+### Changed
+
+- Documented the reviewed scenario E2E loop and GitHub platform verification boundaries in repository and package docs.
+- Included `platform.js` in workspace syntax checks and package smoke coverage.
+
 ## 0.1.3 - 2026-06-02
 
 ### Added

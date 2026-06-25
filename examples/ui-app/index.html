@@ -15,18 +15,40 @@
           A tiny page used to verify screenshots, console errors, and responsive checks.
         </p>
         <div class="actions">
-          <button type="button">Primary action</button>
+          <a class="button-link" href="#checkout">Start checkout</a>
           <a href="#details">View details</a>
         </div>
       </section>
+
+      <section id="checkout" class="panel checkout-panel" aria-labelledby="checkout-title">
+        <h2 id="checkout-title">Checkout sample</h2>
+        <p class="panel-copy">
+          This local flow exists so aiflow can run reviewed Playwright scenarios against a real page.
+        </p>
+        <form id="checkout-form">
+          <label>
+            Email
+            <input name="email" type="email" placeholder="buyer@example.com" required />
+          </label>
+          <label>
+            Coupon
+            <input name="coupon" type="text" placeholder="SAVE10" />
+          </label>
+          <button type="submit">Checkout</button>
+        </form>
+        <p id="order-status" class="status" role="status" aria-live="polite">Waiting for checkout</p>
+      </section>
+
       <section id="details" class="panel">
         <h2>Validation targets</h2>
         <ul>
           <li>Desktop, tablet, and mobile screenshots</li>
           <li>No console errors</li>
           <li>No horizontal overflow</li>
+          <li>Reviewed scenarios can click, fill, assert, and capture evidence</li>
         </ul>
       </section>
     </main>
+    <script src="/app.js"></script>
   </body>
 </html>

@@ -1,0 +1,8 @@
+id: aiflow-cli-productization
+type: bugfix
+entry_role: dev
+current_role: qa
+requirement_level: lightweight
+risk: S1
+ui_required: false
+delivery_status: draft

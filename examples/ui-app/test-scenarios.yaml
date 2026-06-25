@@ -1,0 +1,32 @@
+scenarios:
+  - name: checkout-sample-success
+    source: ai_generated
+    human_review_required: true
+    priority: P0
+    type: happy_path
+    preconditions:
+      - example UI app is running
+      - reviewer approved this scenario for the local checkout sample
+    test_data:
+      route: /
+      email: buyer@example.com
+      coupon: SAVE10
+    steps:
+      - goto: /
+      - click:
+          role: link
+          name: Start checkout
+      - fill:
+          label: Email
+          value: buyer@example.com
+      - fill:
+          label: Coupon
+          value: SAVE10
+      - click:
+          role: button
+          name: Checkout
+      - expect_text: Order confirmed with coupon
+    evidence:
+      screenshots: true
+      console_errors: true
+      responsive: [desktop, tablet, mobile]

@@ -8,4 +8,6 @@
 - Packaging: npm run pack:dry passes and includes `LICENSE` in the CLI package tarball.
 - Packaging: npm run smoke:package passes by installing the tarball into a temporary consumer project.
 - Security: SECURITY.md documents vulnerability reporting and local CLI security boundaries.
+- Boundary: current_role is `qa`; this QA pass is reviewing and validating workflow-boundary hardening that includes source, docs, examples, and release-preflight changes from the active productization change.
+- Boundary: QA validation does not mean aiflow executed release, publish, merge, or archive actions.
 - Risk: final npm publish remains manual and outside normal check/handoff behavior.

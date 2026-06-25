@@ -14,7 +14,7 @@ export function appendEvidence({ root, context, type = "validation", source = "m
   status: ${singleLine(status)}
   command: ${singleLine(command)}
   artifacts:
-${artifacts.length ? artifacts.map((item) => `    - ${singleLine(relative(root, path.resolve(root, item)))}`).join("\n") : "    - none"}
+${artifacts.length ? artifacts.map((item) => `    - ${singleLine(recordArtifact(root, item))}`).join("\n") : "    - none"}
   note: ${singleLine(note)}
   recorded_by: ${singleLine(process.env.USER || process.env.USERNAME || "unknown")}
   recorded_at: ${new Date().toISOString()}
@@ -30,14 +30,14 @@ export function listEvidence({ context }) {
   return { file, text: readText(file) };
 }
 
-export function readEvidenceSummary(changeDir) {
+export function readEvidenceSummary(changeDir, root = "") {
   const text = readText(evidencePath(changeDir));
   if (!text.trim()) return { exists: false, failed: false, passed: false };
   const entries = parseEvidenceEntries(text).filter((entry) => entry.type === "validation");
   return {
     exists: entries.length > 0,
     failed: entries.some((entry) => entry.status === "failed"),
-    passed: entries.some((entry) => entry.status === "passed" && hasLinkedArtifact(entry))
+    passed: entries.some((entry) => entry.status === "passed" && hasLinkedArtifact(entry, root))
   };
 }
 
@@ -48,6 +48,12 @@ function evidencePath(changeDir) {
 function singleLine(value) {
   const text = String(value || "").replace(/\r?\n/g, " ").trim();
   return text || "none";
+}
+
+function recordArtifact(root, value) {
+  const text = String(value || "").trim();
+  if (isUrl(text)) return text;
+  return relative(root, path.resolve(root, text));
 }
 
 function parseEvidenceEntries(text) {
@@ -69,23 +75,35 @@ function parseEvidenceEntries(text) {
     if (fieldMatch) {
       const [, key, val] = fieldMatch;
       inArtifacts = key === "artifacts";
-      if (!inArtifacts) current[key] = normalizeField(val);
+      if (!inArtifacts) current[key] = normalizeScalar(key, val);
       continue;
     }
 
     if (inArtifacts) {
       const artifactMatch = raw.match(/^\s{4}-\s*(.+)$/);
-      if (artifactMatch) current.artifacts.push(normalizeField(artifactMatch[1]));
+      if (artifactMatch) current.artifacts.push(String(artifactMatch[1] || "").trim());
     }
   }
 
   return entries;
 }
 
-function normalizeField(value) {
-  return String(value || "").trim().toLowerCase();
+function normalizeScalar(key, value) {
+  const text = String(value || "").trim();
+  return ["type", "source", "status"].includes(key) ? text.toLowerCase() : text;
 }
 
-function hasLinkedArtifact(entry) {
-  return Array.isArray(entry.artifacts) && entry.artifacts.some((artifact) => artifact && artifact !== "none");
+function hasLinkedArtifact(entry, root) {
+  return Array.isArray(entry.artifacts) && entry.artifacts.some((artifact) => {
+    const value = String(artifact || "").trim();
+    if (!value || value.toLowerCase() === "none") return false;
+    if (isUrl(value)) return true;
+    if (!root) return true;
+    const file = path.isAbsolute(value) ? value : path.resolve(root, value);
+    return exists(file);
+  });
+}
+
+function isUrl(value) {
+  return /^https?:\/\//i.test(String(value || "").trim());
 }

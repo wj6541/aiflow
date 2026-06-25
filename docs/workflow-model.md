@@ -94,11 +94,28 @@ aiflow intake fix-repo-url --type bugfix --from dev --risk s1 --intent "Use conf
 aiflow change start fix-repo-url --type bugfix --from dev --risk s1
 aiflow route --type refactor --from dev --risk s2
 aiflow next
+aiflow next --handoff
+aiflow next --handoff --confirm
+aiflow handoff --to qa --note "Ready for QA"
 aiflow context --role dev
 aiflow prompt --role qa
 ```
 
 `aiflow intake` records a requirement snapshot and recommended route without executing implementation work. `aiflow next` reports missing gates and recommended commands. It does not release, merge, publish, or archive. `aiflow context` and `aiflow prompt` write copyable role packages under `.aiflow/artifacts/`.
+
+When `aiflow intake` is called without `--type`, it uses lightweight intent classification. Ambiguous natural-language requests such as "I want to change the login module" or "I want to refactor the login module" start as `feature_request` with PM as the entry role, because the product goal and behavior boundary are not yet clear. It only infers `refactor` when the intent explicitly says behavior is preserved, such as "refactor the login module without behavior changes" or "only change code structure." Passing `--type` always overrides this inference.
+
+## Role Transitions
+
+`current_role` is runtime state. It controls which role file `check` evaluates for requirement source, risk, validation notes, and which role `context` or `prompt` uses when no `--role` is provided.
+
+`aiflow handoff` without `--to` keeps the older document-only behavior and writes `openspec/changes/<change>/handoff.md`.
+
+`aiflow handoff --to <role> [--note text]` is the explicit role transition command. It updates `.aiflow/state/current.yaml`, updates `openspec/changes/<change>/change.yaml` when available, and appends transition evidence to `handoff.md` with `from_role`, `to_role`, command, commit, note, and current check summary.
+
+`aiflow next --handoff` is the confirmation layer for users and AI assistants. It computes the next role from the route and prints a confirm command without changing state. After the human explicitly confirms, `aiflow next --handoff --confirm [--note text]` performs the same recorded transition using the computed next role, so users do not need to remember `aiflow handoff --to <role>`.
+
+Role transition is intentionally not an agent executor. It does not perform the target role's work, does not mark validation as accepted, and does not perform delivery, merge, release, publish, or archive actions. Those remain separate explicit commands and human gates.
 
 ## Guardrails
 

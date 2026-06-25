@@ -55,7 +55,13 @@ h1 {
 }
 
 button,
-a {
+a,
+input {
+  font: inherit;
+}
+
+button,
+a.button-link {
   display: inline-flex;
   min-height: 40px;
   align-items: center;
@@ -65,14 +71,23 @@ a {
 }
 
 button {
+  cursor: pointer;
   border: 0;
   padding: 0 16px;
   color: #ffffff;
   background: #1d4ed8;
 }
 
-a {
+a,
+a.button-link {
   color: #1d4ed8;
+}
+
+a.button-link {
+  padding: 0 16px;
+  color: #ffffff;
+  background: #1d4ed8;
+  text-decoration: none;
 }
 
 .panel {
@@ -88,11 +103,48 @@ a {
   font-size: 22px;
 }
 
+.panel-copy {
+  max-width: 620px;
+  margin: 0 0 18px;
+  color: #526070;
+  line-height: 1.6;
+}
+
 .panel ul {
   margin: 0;
   padding-left: 20px;
   color: #526070;
   line-height: 1.7;
+}
+
+.checkout-panel form {
+  display: grid;
+  max-width: 420px;
+  gap: 14px;
+}
+
+.checkout-panel label {
+  display: grid;
+  gap: 6px;
+  color: #334155;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.checkout-panel input {
+  min-height: 42px;
+  border: 1px solid #b8c3d1;
+  border-radius: 6px;
+  padding: 0 12px;
+  color: #18212f;
+  background: #ffffff;
+}
+
+.status {
+  min-height: 24px;
+  margin: 18px 0 0;
+  color: #12603a;
+  font-weight: 700;
 }
 
 @media (max-width: 640px) {

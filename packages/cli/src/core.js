@@ -10,6 +10,7 @@ import { currentCommit, detectAiRules, detectCi, detectCommands, detectPackageMa
 import { defaultAgents, defaultOpenSpecReadme, defaultProjectProfile, defaultTools, templateDesign, templateProposal, templateRequirementSnapshot, templateRole, templateTasks, templateUi, templateVisualValidation } from "./templates.js";
 import { generateAiTestScenarios, reviewTestIntent, runTestScenarios, writeAiTestBasePrompt } from "./test-scenarios.js";
 import { addUiDeviation, listUiDeviations, uiClassify as buildUiClassify, uiVerify as runUiVerify } from "./ui.js";
+import { verifyPlatform } from "./platform.js";
 
 export { EXIT };
 
@@ -41,6 +42,7 @@ export async function runCli(argv, io) {
   if (command === "test") return commandTest(parsed, io);
   if (command === "handoff") return commandHandoff(parsed, io);
   if (command === "delivery") return commandDelivery(parsed, io);
+  if (command === "platform") return commandPlatform(parsed, io);
   if (command === "followup") return commandFollowup(parsed, io);
   if (command === "config") return commandConfig(parsed, io);
 
@@ -211,7 +213,8 @@ function commandIntake(parsed, io) {
   const topic = parsed.positionals[1];
   if (!topic) return fail(io, EXIT.CONFIG_ERROR, "Usage: aiflow intake <topic> [--type bugfix] [--from dev] [--risk s1]");
   const slug = slugify(topic);
-  const type = normalizeChangeType(value(parsed, "type", "bugfix"));
+  const inferred = inferIntakeType(parsed);
+  const type = normalizeChangeType(value(parsed, "type", inferred.type));
   const role = value(parsed, "from", value(parsed, "role", defaultEntryRole(type)));
   const risk = value(parsed, "risk", "s1").toLowerCase();
   const hasUi = Boolean(parsed.flags.ui) || type === "ui_change";
@@ -289,6 +292,7 @@ function commandIntake(parsed, io) {
   io.stdout.write(lines([
     ok(`Intake recorded: ${slug}`),
     ok(`Change type: ${type}`),
+    inferred.reason && !hasFlag(parsed, "type") && type !== "bugfix" ? `classification: ${inferred.reason}` : "",
     ok(`Entry role: ${role}`),
     ok(`Requirement level: ${route.requirementLevel}`),
     ok(`Risk: ${risk.toUpperCase()}`),
@@ -299,7 +303,7 @@ function commandIntake(parsed, io) {
     "Next:",
     `- aiflow next`,
     `- aiflow prompt --role ${role}`
-  ]));
+  ].filter(Boolean)));
   return EXIT.PASS;
 }
 
@@ -484,6 +488,9 @@ function commandNext(parsed, io) {
   const nextRole = nextRoleInRoute(route.required, context.state.current_role);
   const missing = [...checks.failures, ...checks.warnings];
   const suggestions = nextSuggestions(context, route, checks.failures, checks.warnings, nextRole, checks.metadata);
+  if (parsed.flags.handoff) {
+    return commandNextHandoff(parsed, io, { context, checks, nextRole });
+  }
 
   io.stdout.write(lines([
     ok(`Current change: ${context.state.active_change}`),
@@ -503,6 +510,33 @@ function commandNext(parsed, io) {
     ...suggestions.map((item) => `- ${item}`)
   ]));
   return checks.failures.length ? EXIT.CHECK_FAILED : EXIT.PASS;
+}
+
+function commandNextHandoff(parsed, io, { context, checks, nextRole }) {
+  if (!nextRole) {
+    io.stdout.write(lines([
+      ok(`Current change: ${context.state.active_change}`),
+      ok(`Current role: ${context.state.current_role}`),
+      "next_role: none",
+      "handoff_available: false"
+    ]));
+    return EXIT.PASS;
+  }
+  if (checks.failures.length) {
+    return fail(io, EXIT.CHECK_FAILED, `Handoff blocked: resolve check failures before moving from ${context.state.current_role} to ${nextRole}.`);
+  }
+  if (!parsed.flags.confirm) {
+    io.stdout.write(lines([
+      ok(`Current change: ${context.state.active_change}`),
+      ok(`Current role: ${context.state.current_role}`),
+      `next_role: ${nextRole}`,
+      "handoff_available: true",
+      "confirmation_required: true",
+      `confirm_command: aiflow next --handoff --confirm --note "${defaultNextHandoffNote(context.state.current_role, nextRole)}"`
+    ]));
+    return EXIT.PASS;
+  }
+  return commandHandoffTo(parsed, io, context, nextRole, defaultNextHandoffNote(context.state.current_role, nextRole));
 }
 
 function commandContext(parsed, io) {
@@ -729,12 +763,60 @@ function commandHandoff(parsed, io) {
   const root = io.cwd;
   const context = getContext(root);
   if (!context.ok) return fail(io, EXIT.CONFIG_ERROR, context.error);
+  if (parsed.flags.to === true) return fail(io, EXIT.CONFIG_ERROR, "Usage: aiflow handoff --to <role> [--note text]");
+  const toRole = value(parsed, "to", "");
+  if (toRole) return commandHandoffTo(parsed, io, context, toRole);
+
   const checks = collectChecks(root, context);
   const content = renderHandoff(context, checks);
   const outPath = path.join(context.changeDir, "handoff.md");
   writeText(outPath, content);
   io.stdout.write(content);
   return EXIT.PASS;
+}
+
+function commandHandoffTo(parsed, io, context, toRole, defaultNote = "explicit role handoff") {
+  const root = io.cwd;
+  const role = String(toRole).trim().toLowerCase();
+  if (!ROLES.has(role)) return fail(io, EXIT.CONFIG_ERROR, `Invalid role: ${toRole}`);
+
+  const fromRole = context.state.current_role;
+  const checks = collectChecks(root, context);
+  const recordedAt = new Date().toISOString();
+  const note = value(parsed, "note", value(parsed, "reason", defaultNote));
+  const command = `aiflow ${parsed.raw.join(" ")}`;
+  const handoffPath = writeHandoffTransition({
+    context,
+    checks,
+    fromRole,
+    toRole: role,
+    note,
+    command,
+    commit: currentCommit(root),
+    recordedAt
+  });
+  const changePath = updateChangeCurrentRole(context, role);
+  updateState(root, {
+    current_role: role,
+    last_handoff_at: recordedAt
+  });
+
+  io.stdout.write(lines([
+    ok(`Handoff recorded: ${fromRole} -> ${role}`),
+    ok(`Current role: ${role}`),
+    `handoff_file: ${relative(root, handoffPath)}`,
+    changePath ? `change_file: ${relative(root, changePath)}` : "",
+    "",
+    "Next:",
+    "- aiflow context",
+    "- aiflow prompt",
+    "- aiflow check"
+  ].filter(Boolean)));
+  return EXIT.PASS;
+}
+
+function defaultNextHandoffNote(fromRole, toRole) {
+  return `Confirmed next handoff from ${fromRole} to ${toRole}`;
 }
 
 function commandDelivery(parsed, io) {
@@ -793,6 +875,29 @@ function deliveryRecord(parsed, io) {
     rawArgs: parsed.raw,
     reason: value(parsed, "reason", ""),
     slugify
+  });
+  if (result.error) io.stderr.write(result.error);
+  if (result.message) io.stdout.write(result.message);
+  return result.code;
+}
+
+async function commandPlatform(parsed, io) {
+  const action = parsed.positionals[1];
+  if (action !== "verify") return fail(io, EXIT.CONFIG_ERROR, "Usage: aiflow platform verify --provider github --pr <url>");
+  const root = io.cwd;
+  const state = loadState(root);
+  const configResult = loadConfig(root);
+  const change = value(parsed, "change", state.active_change || "");
+  const result = await verifyPlatform({
+    root,
+    provider: value(parsed, "provider", "github"),
+    pr: value(parsed, "pr", ""),
+    fromFile: value(parsed, "from-file", ""),
+    baseBranch: value(parsed, "base", configResult.ok ? configResult.config.base_branch : ""),
+    requiredReviews: Number(value(parsed, "required-reviews", "0")),
+    token: process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "",
+    apiUrl: value(parsed, "api-url", ""),
+    change
   });
   if (result.error) io.stderr.write(result.error);
   if (result.message) io.stdout.write(result.message);
@@ -1333,6 +1438,10 @@ function nextSuggestions(context, route, failures, warnings, nextRole, metadata 
   if (missing.some((item) => item.includes("test intent requires human review"))) {
     suggestions.push("aiflow test review");
   }
+  if (missing.some((item) => item.includes("reviewed test intent"))) {
+    suggestions.push("aiflow test generate");
+    suggestions.push("aiflow test review");
+  }
   if (missing.some((item) => item.includes("Risk Approval"))) {
     suggestions.push(`aiflow change approve ${context.state.active_change} --risk ${context.state.risk}`);
   }
@@ -1346,6 +1455,7 @@ function nextSuggestions(context, route, failures, warnings, nextRole, metadata 
     suggestions.push("edit .aiflow/artifacts/ui/ui-brief.md");
   }
   if (route.gates.ui_evidence === "required" || metadata.ui_required) suggestions.push("aiflow ui classify && aiflow ui verify --url <url>");
+  if (nextRole && !failures.length) suggestions.push(`aiflow handoff --to ${nextRole}`);
   if (nextRole) suggestions.push(`aiflow context --role ${nextRole}`);
   if (nextRole) suggestions.push(`aiflow prompt --role ${nextRole}`);
   if (!failures.length && (metadata.delivery_approval_required || route.gates.release_record === "required")) {
@@ -1357,6 +1467,50 @@ function nextSuggestions(context, route, failures, warnings, nextRole, metadata 
   }
   if (!suggestions.length) suggestions.push("aiflow check");
   return unique(suggestions);
+}
+
+function inferIntakeType(parsed) {
+  if (hasFlag(parsed, "type")) return { type: value(parsed, "type", "bugfix"), reason: "" };
+
+  const text = normalizeIntentText([
+    parsed.positionals[1],
+    value(parsed, "intent", ""),
+    value(parsed, "value", ""),
+    value(parsed, "acceptance", "")
+  ].filter(Boolean).join(" "));
+
+  if (!text) return { type: "bugfix", reason: "" };
+  if (looksLikeBugfix(text)) return { type: "bugfix", reason: "" };
+  if (looksLikePureRefactor(text)) return { type: "refactor", reason: "pure_engineering_refactor" };
+  if (looksLikeUiChange(text)) return { type: "ui_change", reason: "ui_or_experience_intent" };
+  if (looksLikeAmbiguousRefactor(text)) return { type: "feature_request", reason: "pm_clarification_for_ambiguous_refactor" };
+  if (looksLikeProductIntent(text)) return { type: "feature_request", reason: "pm_clarification_for_product_intent" };
+  return { type: "bugfix", reason: "" };
+}
+
+function normalizeIntentText(input) {
+  return String(input || "").trim().toLowerCase();
+}
+
+function looksLikeBugfix(text) {
+  return /(bug|fix|broken|error|failure|failed|regression|修复|故障|失败|报错|错误|异常)/i.test(text);
+}
+
+function looksLikePureRefactor(text) {
+  return looksLikeAmbiguousRefactor(text)
+    && /(without behavior change|no behavior change|no user-facing behavior change|preserve behavior|keep behavior|behavior unchanged|internal only|code structure only|only code structure|technical debt|maintainability|不改变行为|不改变功能|不改功能|不改业务|不影响用户|保持行为|行为不变|仅代码结构|只改代码结构|只做代码结构|内部实现|技术债|可维护)/i.test(text);
+}
+
+function looksLikeUiChange(text) {
+  return /(ui|ux|screen|page|layout|style|visual|interaction|experience|页面|界面|交互|样式|视觉|体验)/i.test(text);
+}
+
+function looksLikeAmbiguousRefactor(text) {
+  return /(refactor|restructure|重构)/i.test(text);
+}
+
+function looksLikeProductIntent(text) {
+  return /(want|need|add|support|change|improve|optimize|flow|user|business|experience|我想|希望|需要|想要|新增|增加|支持|更改|修改|调整|优化|改造|改版|流程|用户|业务)/i.test(text);
 }
 
 function defaultEntryRole(type) {
@@ -1477,6 +1631,65 @@ function renderHandoff(context, checks) {
 `;
 }
 
+function writeHandoffTransition({ context, checks, fromRole, toRole, note, command, commit, recordedAt }) {
+  const file = path.join(context.changeDir, "handoff.md");
+  const current = readText(file);
+  const base = current.trim()
+    ? ensureTransitionHistorySection(current)
+    : `${renderHandoff(context, checks).trim()}\n\n## Transition History\n\n`;
+  writeText(file, `${base}${renderHandoffTransition({ checks, fromRole, toRole, note, command, commit, recordedAt })}`);
+  return file;
+}
+
+function ensureTransitionHistorySection(text) {
+  const trimmed = String(text || "").replace(/\s*$/, "\n");
+  if (trimmed.includes("## Transition History")) return trimmed;
+  return `${trimmed}\n## Transition History\n\n`;
+}
+
+function renderHandoffTransition({ checks, fromRole, toRole, note, command, commit, recordedAt }) {
+  return `### ${recordedAt}
+
+- from_role: ${fromRole}
+- to_role: ${toRole}
+- command: ${oneLine(command)}
+- commit: ${commit || "unknown"}
+- note: ${oneLine(note)}
+- checks_result: ${checks.failures.length ? "blocked" : "ready"}
+- failures: ${checks.failures.length ? oneLine(checks.failures.join("; ")) : "none"}
+- warnings: ${checks.warnings.length ? oneLine(checks.warnings.join("; ")) : "none"}
+
+`;
+}
+
+function updateChangeCurrentRole(context, role) {
+  const file = path.join(context.changeDir, "change.yaml");
+  const current = readText(file);
+  const next = current.trim()
+    ? setFlatYamlScalar(current, "current_role", role)
+    : renderChangeYaml({
+      id: context.change.id || context.state.active_change,
+      type: context.change.type,
+      entryRole: context.change.entry_role,
+      currentRole: role,
+      requirementLevel: context.change.requirement_level,
+      risk: context.state.risk || context.change.risk || "s1",
+      uiRequired: context.state.ui_required
+    });
+  writeText(file, next);
+  return file;
+}
+
+function setFlatYamlScalar(text, key, val) {
+  const pattern = new RegExp(`^${key}:\\s*.*$`, "m");
+  if (pattern.test(text)) return text.replace(pattern, `${key}: ${val}`);
+  return `${String(text || "").replace(/\s*$/, "\n")}${key}: ${val}\n`;
+}
+
+function oneLine(value) {
+  return String(value || "").replace(/\r?\n/g, " ").trim() || "none";
+}
+
 function inferActiveChange(root) {
   const changesDir = path.join(root, "openspec", "changes");
   if (!exists(changesDir)) return "";
@@ -1509,6 +1722,10 @@ function parseArgs(argv) {
 
 function value(parsed, key, fallback) {
   return parsed.flags[key] === true || parsed.flags[key] == null ? fallback : String(parsed.flags[key]);
+}
+
+function hasFlag(parsed, key) {
+  return Object.prototype.hasOwnProperty.call(parsed.flags, key);
 }
 
 function commandLine(name, command) {
@@ -1558,7 +1775,7 @@ Usage:
   aiflow change approve <change> --scope|--design|--risk s2
   aiflow intake <topic> [--type bugfix] [--from dev] [--risk s1] [--intent text] [--value text] [--acceptance text]
   aiflow route [--type bugfix] [--from dev] [--risk s1] [--ui]
-  aiflow next
+  aiflow next [--handoff] [--confirm] [--note text]
   aiflow context [--role dev]
   aiflow prompt [--role dev]
   aiflow evidence add [--type validation] [--source manual] [--status passed] [--artifact file] [--command command] [--note text]
@@ -1574,11 +1791,12 @@ Usage:
   aiflow test approve [--reason text]
   aiflow test run --command "npm test"
   aiflow test run --url http://localhost:3000 [--scenario file] [--reviewed]
-  aiflow handoff
+  aiflow handoff [--to qa] [--note text]
   aiflow delivery approve
   aiflow delivery prepare
   aiflow delivery record <change> --action mr|merge|release --ref <value>
   aiflow delivery archive <change>
+  aiflow platform verify --provider github --pr <url> [--base main] [--required-reviews 1]
   aiflow followup add <title> [--file path] [--reason text]
   aiflow followup list
   aiflow config migrate [--ci] [--allow-write]

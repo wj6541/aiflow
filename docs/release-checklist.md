@@ -12,9 +12,12 @@ Manual equivalent:
 
 ```bash
 npm run check
+npm run registry:check
 npm run pack:dry
 npm run smoke:package
 ```
+
+`registry:check` verifies that `packages/cli/package.json` points to an npm package version that does not already exist.
 
 The dry-run script uses a project-local npm cache. Underlying pack command:
 

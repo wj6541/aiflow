@@ -583,6 +583,16 @@ function validateScenarioSafety(source) {
   const lines = String(source).split(/\r?\n/);
   let inSteps = false;
   let sawScenario = false;
+  let currentScenario = "";
+  let currentStepCount = 0;
+  let currentAssertionCount = 0;
+
+  function validateCurrentScenario() {
+    if (!currentScenario) return null;
+    if (currentStepCount === 0) return `${currentScenario} must include at least one executable step`;
+    if (currentAssertionCount === 0) return `${currentScenario} must include at least one expect_* assertion`;
+    return null;
+  }
 
   for (const raw of lines) {
     const line = raw.replace(/#.*$/, "");
@@ -590,9 +600,14 @@ function validateScenarioSafety(source) {
 
     const scenarioName = line.match(/^\s*-\s+name:\s*(.+)\s*$/);
     if (scenarioName) {
+      const previousError = validateCurrentScenario();
+      if (previousError) return { ok: false, error: previousError };
       sawScenario = true;
       const safeName = sanitizeScenarioName(cleanYamlValue(scenarioName[1]));
       if (!safeName) return { ok: false, error: "scenario.name must contain at least one safe filename character" };
+      currentScenario = cleanYamlValue(scenarioName[1]);
+      currentStepCount = 0;
+      currentAssertionCount = 0;
       inSteps = false;
       continue;
     }
@@ -614,10 +629,14 @@ function validateScenarioSafety(source) {
       if (name === "goto" && !isRelativePath(cleanYamlValue(value))) {
         return { ok: false, error: `goto must be a relative path: ${cleanYamlValue(value)}` };
       }
+      currentStepCount += 1;
+      if (name.startsWith("expect_")) currentAssertionCount += 1;
     }
   }
 
   if (!sawScenario && /scenarios:\s*\n\s*-/m.test(source)) return { ok: false, error: "scenario.name is required" };
+  const lastError = validateCurrentScenario();
+  if (lastError) return { ok: false, error: lastError };
   return { ok: true };
 }
 
@@ -649,14 +668,15 @@ function ensureTrailingNewline(text) {
 }
 
 function playwrightScenarioRunnerSource() {
-  return `import { chromium } from "playwright";
-import fs from "node:fs";
+  return `import fs from "node:fs";
 import path from "node:path";
+const { chromium } = await loadPlaywright();
 
 const [scenarioPath, baseUrl, resultsPath, screenshotsDir] = process.argv.slice(2);
 const text = fs.readFileSync(scenarioPath, "utf8");
 const scenarios = parseScenarios(text);
 const results = [];
+const startedAt = new Date().toISOString();
 
 fs.mkdirSync(path.dirname(resultsPath), { recursive: true });
 fs.mkdirSync(screenshotsDir, { recursive: true });
@@ -672,18 +692,28 @@ try {
     page.on?.("pageerror", (error) => {
       errors.push(error.message);
     });
-    const result = { name: scenario.name, status: "passed", errors: [] };
+    const screenshotPath = path.join(screenshotsDir, safeFileName(scenario.name) + ".png");
+    const failedScreenshotPath = path.join(screenshotsDir, safeFileName(scenario.name) + "-failed.png");
+    const result = {
+      name: scenario.name,
+      status: "passed",
+      steps: scenario.steps.length,
+      assertions: scenario.steps.filter((step) => Object.keys(step)[0]?.startsWith("expect_")).length,
+      screenshot: screenshotPath,
+      errors: []
+    };
     try {
       for (const step of scenario.steps) {
         await runStep(page, baseUrl, step);
       }
       if (errors.length) throw new Error("Console errors: " + errors.join("; "));
-      await page.screenshot?.({ path: path.join(screenshotsDir, safeFileName(scenario.name) + ".png"), fullPage: true });
+      await page.screenshot?.({ path: screenshotPath, fullPage: true });
     } catch (error) {
       result.status = "failed";
+      result.screenshot = failedScreenshotPath;
       result.errors.push(error instanceof Error ? error.message : String(error));
       try {
-        if (page.screenshot) await page.screenshot({ path: path.join(screenshotsDir, safeFileName(scenario.name) + "-failed.png"), fullPage: true });
+        if (page.screenshot) await page.screenshot({ path: failedScreenshotPath, fullPage: true });
       } catch {}
     } finally {
       await page.close?.();
@@ -695,7 +725,14 @@ try {
 }
 
 const failed = results.some((item) => item.status !== "passed");
-fs.writeFileSync(resultsPath, JSON.stringify({ result: failed ? "fail" : "pass", scenarios: results }, null, 2) + "\\n");
+fs.writeFileSync(resultsPath, JSON.stringify({
+  result: failed ? "fail" : "pass",
+  base_url: baseUrl,
+  scenario_count: results.length,
+  started_at: startedAt,
+  finished_at: new Date().toISOString(),
+  scenarios: results
+}, null, 2) + "\\n");
 if (failed) process.exitCode = 1;
 
 async function runStep(page, baseUrl, step) {
@@ -790,6 +827,18 @@ function safeFileName(value) {
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "")
     .slice(0, 80) || "scenario";
+}
+
+async function loadPlaywright() {
+  try {
+    return await import("playwright");
+  } catch (primaryError) {
+    try {
+      return await import("@playwright/test");
+    } catch {
+      throw primaryError;
+    }
+  }
 }
 `;
 }
